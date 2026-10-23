@@ -5438,10 +5438,7 @@ pub fn stack_agent_env_vars(
     api_key: Option<&str>,
 ) -> Vec<(String, String)> {
     let key_val = api_key.filter(|k| !k.is_empty()).unwrap_or("atomic");
-    let endpoint = format!(
-        "{}/chat/completions",
-        api_url.trim().trim_end_matches('/')
-    );
+    let endpoint = format!("{}/chat/completions", api_url.trim().trim_end_matches('/'));
     vec![
         ("CHIP_PROVIDER".to_string(), "openai-compatible".to_string()),
         ("CHIP_ENDPOINT".to_string(), endpoint),
@@ -7153,10 +7150,14 @@ mod stack_agent_tests {
     #[test]
     fn off_path_candidates_cover_the_installer_and_cargo_dirs() {
         let candidates = off_path_candidates("stack-agent");
-        assert!(candidates.iter().any(|p| p.ends_with(".local/bin/stack-agent")
-            || p.ends_with(".local/bin/stack-agent.exe")));
-        assert!(candidates.iter().any(|p| p.ends_with(".cargo/bin/stack-agent")
-            || p.ends_with(".cargo/bin/stack-agent.exe")));
+        assert!(candidates
+            .iter()
+            .any(|p| p.ends_with(".local/bin/stack-agent")
+                || p.ends_with(".local/bin/stack-agent.exe")));
+        assert!(candidates
+            .iter()
+            .any(|p| p.ends_with(".cargo/bin/stack-agent")
+                || p.ends_with(".cargo/bin/stack-agent.exe")));
     }
 }
 
