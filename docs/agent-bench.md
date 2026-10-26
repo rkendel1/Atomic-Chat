@@ -1,11 +1,19 @@
-# Agent Bench
+# Agent Workshop (Agent Bench)
 
-Agent Bench runs coding agents against repeatable tasks from inside Atomic Chat, verifies each
-result independently of what the agent says, keeps every run in a durable ledger, compares runs,
-and exports the ledger for analysis. Open it from the **Server** section of the sidebar
-(**Agent Bench**, route `/bench/`). Desktop only.
+The Agent Workshop runs coding agents against repeatable tasks from inside Atomic Chat, verifies
+each result independently of what the agent says, keeps every run in a durable ledger, explains
+why a run failed as far as the evidence shows, turns a failure into a regression task, runs
+regression suites and compares them, and exports the ledger for analysis:
 
-Decision record: [`decisions/2026-10-26-record-agent-bench-runs-in-a-file-ledger-verified-by-explicit-commands.md`](decisions/2026-10-26-record-agent-bench-runs-in-a-file-ledger-verified-by-explicit-commands.md).
+**Run → Observe → Diagnose → Reproduce → Improve → Re-run → Verify.**
+
+Open it from the **Server** section of the sidebar (**Agent Workshop**, route `/bench/`). Tabs:
+**Runs** (tasks, run settings, run inspector, run comparison, history), **Regression suites**,
+**Failures**. Desktop only.
+
+Decision records:
+[run ledger](decisions/2026-10-26-record-agent-bench-runs-in-a-file-ledger-verified-by-explicit-commands.md),
+[failure analysis, baselines, regressions, suites](decisions/2026-10-26-classify-agent-failures-by-deterministic-rules-over-recorded-evidence.md).
 Code: `src-tauri/src/core/agent_bench/` (Rust), `web-app/src/routes/bench/`,
 `web-app/src/containers/agent-bench/`, `web-app/src/lib/agent-bench/`.
 
@@ -18,8 +26,7 @@ Code: `src-tauri/src/core/agent_bench/` (Rust), `web-app/src/routes/bench/`,
    keeps it current; it needs git and [rustup](https://rustup.rs). Also put
    [`pax`](https://github.com/rkendel1/pax) 0.4.1+ on your `PATH`: stack-agent's `change` work
    completes only through a passing `pax test`. Optionally install Claude Code from the Launch
-   page. `cargo` must be on your login-shell `PATH` for the bundled
-   benchmark's checks.
+   page. `cargo` must be on your login-shell `PATH` for the bundled benchmark's checks.
 3. Open **Agent Bench**, pick a ★ bundled task, tick the agents, check the model, press **Run**.
 4. Open a run in **Run history** to see the command, exit status, output, verification checks,
    changed files and configuration. Tick two or more runs to compare them.
@@ -79,7 +86,7 @@ The agent's exit status and self-report are recorded (`execution.exit_code`,
 
 | Agent | Invocation | Model / endpoint | Notes |
 | --- | --- | --- | --- |
-| stack-agent | `stack-agent work "<prompt>" --kind change --json --deadline-secs <timeout> [--max-turns N --max-executions 2N]` (limits capped at 50) | `CHIP_PROVIDER`, `CHIP_ENDPOINT` (`<Local API>/v1/chat/completions`), `CHIP_MODEL`, `CHIP_API_KEY`, `CHIP_CALL_TIMEOUT_SECS=600` — the same values the Launch page writes | Other `CHIP_*` tuning variables and `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` are removed from the child environment so the record describes the whole configuration. Its durable record is referenced as `stack-agent agent-state show --task-id …` |
+| stack-agent | `stack-agent work "<prompt>" --kind change --json --print-reply --deadline-secs <timeout> [--state-db <ledger>/evidence/<run>/stack-agent-state.feltdb] [--max-turns N --max-executions 2N]` (limits capped at 50); after the run, `stack-agent agent-state show --state-db … --task-id … --json` for its trajectory | `CHIP_PROVIDER`, `CHIP_ENDPOINT` (`<Local API>/v1/chat/completions`), `CHIP_MODEL`, `CHIP_API_KEY`, `CHIP_CALL_TIMEOUT_SECS=600` — the same values the Launch page writes | Other `CHIP_*` tuning variables and `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` are removed from the child environment so the record describes the whole configuration. Its durable record is referenced as `stack-agent agent-state show --task-id …` |
 | Claude Code | `claude -p "<prompt>" --output-format json --permission-mode acceptEdits [--model M]` | With "Use the Local API Server": `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL` and the tier aliases (as the Launch page writes them); `ANTHROPIC_API_KEY` removed. Otherwise Claude Code's own configuration | `acceptEdits` allows file edits; shell commands that would need approval are refused in print mode. `env` in `~/.claude/settings.json` takes precedence over these variables. No turn limit is passed |
 
 Not yet supported in the bench (no adapter): every other Launch-page integration. Codex
@@ -149,7 +156,13 @@ removes. One refresh runs at a time across processes.
 4. An unmanaged `stack-agent` on `PATH` (recorded as `external`, commit unknown).
 
 The run resolves once, before it starts, and holds a lease, so activating or pruning another
-runtime never changes what a run executes.
+runtime never changes what a run executes. Just before launching, the executor hashes the program
+it is about to start and refuses to run it if the hash differs from the recorded
+`binary_sha256`. So the recorded commit and digest are those of the file that ran.
+
+Workshop runs, regression tasks and suite runs all take this path. A **suite run** resolves the
+runtime once and gives that same managed executable to every entry, so a refresh in the middle of
+a suite cannot split it across revisions.
 
 **Provenance.** Every stack-agent run records `agent.runtime`:
 - `source`: `managed`, `custom_path` or `external`;
@@ -188,6 +201,134 @@ The change summary is a content snapshot before and after the agent (no git need
 `.git`, `target`, `node_modules`, `.venv`, `__pycache__` and the agents' own bookkeeping directories
 (`.stack-agent`, `.claude`), and says when a project has more than 20 000 files.
 
+## Run inspector
+
+Open a run from **Run history**, a suite, or the **Failures** tab. It answers, in order:
+
+| Question | Where it comes from |
+| --- | --- |
+| What was the agent asked? | The exact prompt, task id, version and digest; for a regression task, the run it was made from |
+| Why did it fail? | The failure analysis (below): candidate causes, each with source, rule, confidence and evidence |
+| Where did execution stop? | The agent's last terminal event when its trajectory was captured, otherwise what the bench observed (not started, time limit, cancelled, process exit) |
+| What remains unknown? | The analysis' unknowns, e.g. a trajectory that could not be read, or that a model's stated reason is only a claim |
+| What happened, in order? | A timeline of the bench's status changes and process start/end, the agent's own events, each check, and reviews. Entries without evidence are shown as **Missing** |
+| What did it execute? | Command line, process outcome, exit code/signal, stdout/stderr, the agent's report |
+| What did the model say? | The replies the agent printed (stack-agent `--print-reply`), labeled as claims |
+| What changed? Which checks passed? | Change summary; each check with its command, exit code and output |
+| Can it be reproduced? | The baseline identity, whether the workspace was fresh, excluded paths and limitations |
+
+Every item carries one evidence class, kept apart everywhere (inspector, timeline, analysis,
+export):
+
+| Class | Meaning |
+| --- | --- |
+| Observed | Atomic Chat or the agent's host saw it happen (a process exited, an execution failed) |
+| Agent runtime | The agent's runtime decided it (it escalated, its loop guard stopped it) |
+| Agent claim | The model said it (a decision, a reason, "done"). Never evidence of success |
+| Verified | A verification command established it |
+| Human | A reviewer concluded it |
+| Missing | The evidence does not exist for this run |
+
+The bench never infers hidden reasoning or invents tool calls: the timeline holds only what the
+agent recorded.
+
+## Failure analysis — `atomic.bench.analysis.v1`
+
+Every finished run (and a manual run awaiting review) carries an analysis computed by deterministic
+rules (`atomic.bench.rules.1`) from the record alone. Causes are **candidates**, never facts. A run
+can have several; one is primary (a reviewer's first; then what stopped the work; then
+explanations; then "insufficient evidence"; the bare fact of failed checks last).
+
+| Rule | Category | Confidence | When |
+| --- | --- | --- | --- |
+| R1 | Process or infrastructure | high | Atomic Chat stopped mid-run (interrupted) |
+| R2 | Process or infrastructure | high | The agent could not start |
+| R3 | Timeout or resource limit | high | The task's time limit stopped the agent |
+| R4 | Timeout or resource limit | high | The agent's own turn/execution/time limit stopped it |
+| R5 | Model output or decision format | medium | A model reply hit its output-token cap |
+| R6 | Process or infrastructure | medium | A model call failed (timeout, transport) |
+| R7 | Model output or decision format | high | Replies were not valid decisions, or a decision was rejected |
+| R8 | Safety or authority rejection | high | Audit violations, replaced test files, invalidated evidence, protected/reserved paths |
+| R9 | Goal not completed | high | The agent escalated or was blocked, and checks failed |
+| R10 | Incorrect or incomplete implementation | high | The agent claimed completion, changed files, and checks failed |
+| R11 | Goal not completed | high | The agent claimed completion without changing anything, and checks failed |
+| R12 | Incorrect or incomplete implementation | medium | Files changed (no completion claim) and checks failed |
+| R13 | Verification failure | high | A check failed or timed out |
+| R14 | Tool or capability failure | medium | A capability failed (e.g. `project.git.status: not_a_repository`); contributing only |
+| R15 | Context or discovery | medium | The model's context hit its limit |
+| R16 | Context or discovery | low | The agent stopped without listing, searching or reading the project |
+| R17 | Process or infrastructure | medium | A verification command could not run |
+| R18 | Insufficient evidence | high | Verification established no outcome |
+| R19 | Insufficient evidence | high | Waiting for a reviewer |
+| R20 | Insufficient evidence | high | The run failed and nothing in the evidence explains why |
+| R21 | Context or discovery | medium | stack-agent's loop guard stopped it for repeating a search/read/list |
+
+Reviewers can record a cause (category, confidence, note) in the inspector; it is stored beside
+the rules' causes, which stay as they were. Diagnoses proposed by a model or tool go in
+`suggestions`, which the rules never read and which never become causes. A changed rule gets a new
+rules version.
+
+## Baselines and fresh workspaces
+
+Every run records `baseline`: what it started from.
+
+| Workdir | Start | Identity |
+| --- | --- | --- |
+| `fixture` | A fresh copy of the bundled files, made a git repository with one baseline commit (fixed author, date and config, no hooks), so the same fixture always yields the same commit | `fixture:<id>@<content sha256>` |
+| `git_snapshot` | A fresh copy of one commit's tracked files (`git archive`), minus credential-shaped paths (`.env*`, `.ssh`, `.aws`, private keys, `*.pem`, `secrets.*`, …), committed the same way. The repository is only read | `git:<commit>` |
+| `path` | The project itself, in place | `git:<HEAD>` when clean, else `path:<content sha256>`; the record says the start cannot be restored, and whether the tree was dirty |
+
+A fixture or snapshot workspace is never reused: a run refuses a directory that exists.
+
+## Regression tasks
+
+From a finished run, **Create regression task** makes a new task (new id, version 1) that copies
+what the run was given — goal, criteria, verification commands, held-out checks, limits — and
+records `origin`: the source run, task id/version/digest, status, checks, primary cause, agent,
+version and model, baseline, a person's required description of the failure, an optional proposed
+improvement, and limitations. Its `expected` outcome defaults to `success` (the fix should make
+every check pass). The source task and run are only read.
+
+A project source becomes a `git_snapshot` of its starting commit only if that start was clean;
+otherwise the regression runs on the project in place and says it cannot be reproduced. Every
+regression records that model output is not deterministic.
+
+Every saved task version is archived write-once (`task_versions/<id>/v<n>.json`), so a suite can
+pin a version that later edits or a deletion cannot change.
+
+## Regression suites — `atomic.bench.suite.v1`
+
+A suite pins tasks at a version, each with its expected outcome, verification procedure, baseline
+and source run. **Run suite** runs every entry at its pinned version with one agent/model
+configuration (taken from the Runs tab), one at a time, as a suite run
+(`atomic.bench.suite_run.v1`, labeled e.g. "baseline" or "after-fix"). An entry whose pinned
+version is no longer stored, or whose digest changed, is recorded as not started with the reason.
+
+Aggregation never counts an unverified run either way:
+
+- **Verified success rate** = verified successes / (verified successes + verified failures), shown
+  with its denominator; no rate when nothing was verified.
+- **Exclusions**, each with a reason: inconclusive, agent could not run, interrupted, cancelled,
+  still running, human-judged (reported apart), not started, run missing from the ledger.
+- Durations are summed over the runs that recorded one, and say how many did.
+
+Pick a baseline and a candidate suite run to compare. A task is an **improvement** or
+**regression** only if both sides verified it at the same task version and the same baseline;
+otherwise it is **not comparable**, with the reason. Warnings list every condition that differs:
+suite version, agent, agent version, Stack-Agent revision (`agent_revision`, same agent only),
+model, provider, configuration (same agent only) and app version, and conditions recorded as
+unknown, which cannot be confirmed equal. A stack-agent run with no recorded runtime (made before
+runtime management, or an unmanaged executable) has an unknown revision. Other agents have no
+managed runtime and are "not applicable", never unknown.
+
+## Failures — what to fix next
+
+The **Failures** tab groups finished, unsuccessful runs (optionally for one agent) by primary
+cause, most frequent first, with contributing counts and up to five example runs with their
+evidence. Each example offers **Create follow-up regression task**; add it to a suite, change the
+agent yourself, and run the suite again to see whether the change helped. Nothing here modifies an
+agent, model settings or code.
+
 ## Storage
 
 `<Atomic Chat data folder>/agent_bench/`:
@@ -195,9 +336,16 @@ The change summary is a content snapshot before and after the agent (no git need
 | Path | Content |
 | --- | --- |
 | `tasks/<id>.json` | Saved tasks (`atomic.bench.task.v1`). Bundled tasks are built in |
-| `runs/<run id>.json` | One run record each (`atomic.bench.run.v1`) |
-| `workspaces/<run id>/` | The fixture copy a run worked in, kept for inspection |
+| `task_versions/<id>/v<n>.json` | Every saved task version, write-once |
+| `runs/<run id>.json` | One run record each (`atomic.bench.run.v1`), with its analysis |
+| `evidence/<run id>/` | What the agent recorded about the run (stack-agent's FeltDB), outside the project |
+| `workspaces/<run id>/` | The fixture or snapshot copy a run worked in, kept for inspection |
+| `suites/<id>.json`, `suites/versions/<id>/v<n>.json` | Suites and every suite version |
+| `suite_runs/<id>.json` | Suite runs |
 | `exports/*.jsonl` | Exports |
+
+Run records written before the workshop load unchanged and are analyzed when read (nothing is
+rewritten).
 
 The stack-agent runtime cache is beside it, in `<Atomic Chat data folder>/stack-agent-runtime/`:
 `state.json`, `runtimes/<arch>-<os>/<commit>/` (`bin/stack-agent` and `runtime.json`, its
@@ -249,6 +397,16 @@ review are included, with `final_status: "evaluating"`).
 | `agent_claims` | The agent's own statements about its work. Not evidence |
 | `unknown` | Every field whose value was not available (e.g. `observed.agent_version` when `--version` did not answer). A field that is `null` because the thing did not happen (no cancellation, no signal) is not listed |
 
+Added within `v1` (absent from lines exported before):
+
+| Section | Holds |
+| --- | --- |
+| `analysis` | The failure analysis: causes with category, source, rule, confidence, evidence (each with its evidence class), unknowns, and `suggestions` kept apart |
+| `reproducibility` | `baseline`, `fresh_workspace`, the task's `origin` and `expected` outcome, and every known limitation |
+| `suite` | The suite, suite version and suite run the run belongs to |
+| `agent_trace` | Where the trajectory came from, whether it was available (and why not), events by provenance, each event's index/time/provenance/kind/summary, and the number of model replies (their text is in `agent_claims.model_replies`) |
+| `evidence_gaps` | Evidence the run lacks: `baseline`, `agent_trace`, `model_replies`, `process_timestamps` |
+
 New fields may be added within `v1`; a changed meaning gets a new schema version.
 
 ## Bundled benchmark — `atomic-ledger` v1
@@ -271,6 +429,12 @@ weights.
   restart recovery, lifecycle transitions, cancellation and timeouts (including the agent's child
   processes), redaction, execution vs. verification failures, manual evaluation, export, adapters,
   and the bundled fixture with held-out checks (needs `cargo`).
+- Rust, workshop: `agent_bench::tests_workshop` — classification from real-shaped stack-agent
+  evidence, unknown and ambiguous cases, suggestions kept apart, the timeline with partial data,
+  fixture/snapshot/project baselines (determinism, no reuse, credential exclusion), regression tasks
+  without touching their source, task-version archiving, suite denominators and exclusions,
+  comparison warnings, the failure summary, compatibility with records written before the
+  workshop, and the whole loop with fake stack-agent executables (`work` and `agent-state show`).
 - Rust, runtime manager: `cargo test --lib stack_agent_runtime`. A fake source whose "builds" are
   shell scripts covers:
   - first acquisition, reuse without a rebuild, and a newer `main`;
@@ -278,17 +442,26 @@ weights.
   - interrupted preparation, rollback, pinning, and concurrent and cross-process refreshes;
   - offline start, staleness, pruning with leases, unmanaged executables, and credentials.
 
-  `agent_bench::tests::runtime_provenance` runs bench tasks through managed runtimes. It checks
-  that the recorded revision is the one that ran, that a pinned historical revision reproduces after
-  `main` moves, and the export.
+  `agent_bench::tests_runtime` runs Workshop tasks through managed runtimes via the same
+  `prepare_run` the app uses. It checks:
+  - the recorded commit, path and executable digest are those of what ran;
+  - a refresh during a run neither changes nor prunes its runtime;
+  - an executable changed after resolution is never launched;
+  - a pinned historical revision reproduces after `main` moves;
+  - a suite run keeps one runtime, and regression tasks and suites still work;
+  - unknown provenance is never comparable, and other agents are not asked for one;
+  - the export keeps the Workshop sections and adds the runtime;
+  - records written before runtime provenance still load.
 - Web: `web-app/src/lib/agent-bench/__tests__`:
-  - comparison with missing and incompatible metrics, revision attribution and causes;
-  - command-line parsing.
+  - run comparison, including revision attribution and causes;
+  - stop point, rate and command-line parsing.
 
   Real-browser layout suites:
-  - `web-app/src/routes/bench/__tests__/AgentBenchPage.layout.test.tsx`;
-  - `web-app/src/containers/agent-bench/__tests__/RuntimePanel.layout.test.tsx`: current, stale,
-    refreshing, failed, pinned and not-prepared states.
+  - `routes/bench/__tests__/AgentBenchPage.layout.test.tsx`;
+  - `containers/agent-bench/__tests__/RunInspector.layout.test.tsx`: the inspector with complete,
+    partial and missing evidence;
+  - `containers/agent-bench/__tests__/RuntimePanel.layout.test.tsx`: current, stale, refreshing,
+    failed, pinned and not-prepared states.
 - Real runtime, opt-in: resolves, fetches, builds, validates and activates the real `main`, reuses
   it, then starts "offline" from the cache:
 
@@ -307,4 +480,15 @@ weights.
   ```
 
   For Claude Code use `ATOMIC_BENCH_AGENT=claude-code` and the bare server URL
-  (`http://127.0.0.1:1337`).
+  (`http://127.0.0.1:1337`). `ATOMIC_BENCH_DATA_DIR=<dir>` keeps the ledger (point it at the app's
+  data folder to see the runs in the app).
+- The whole loop with a real agent and model, opt-in: run a task, make a regression task, add it to
+  a suite, run the suite twice with the same configuration and once with another model, compare,
+  export; writes inspections, comparisons and the export to `ATOMIC_BENCH_OUT`:
+
+  ```sh
+  ATOMIC_BENCH_DATA_DIR=<ledger dir> ATOMIC_BENCH_OUT=<out dir> \
+  ATOMIC_BENCH_API_URL=http://127.0.0.1:1337/v1 ATOMIC_BENCH_MODEL=<model> \
+  [ATOMIC_BENCH_ALT_MODEL=<another model>] \
+  cargo test --lib agent_bench::tests_workshop::live_workshop_loop -- --ignored --nocapture
+  ```

@@ -3,19 +3,29 @@
 //! in a durable, exportable ledger. See docs/agent-bench.md.
 
 pub mod adapters;
+pub mod analysis;
+pub mod baseline;
 pub mod changes;
 pub mod commands;
+pub mod evidence;
 pub mod executor;
 pub mod export;
 pub mod process;
 pub mod redact;
+pub mod regression;
+pub mod regression_suite;
 pub mod run;
 pub mod store;
 pub mod suite;
 pub mod task;
+pub mod timeline;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_runtime;
+#[cfg(test)]
+mod tests_workshop;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};

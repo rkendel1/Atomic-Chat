@@ -67,6 +67,16 @@ title: "Manage the stack-agent runtime from pinned main commits"
   - No change to stack-agent was needed: the manager knows the commit because it built it.
     `stack-agent --version` still does not report a commit, so an unmanaged executable's revision
     stays unknown.
+  - Integrated with the Agent Workshop
+    ([2026-10-26 failure analysis](2026-10-26-classify-agent-failures-by-deterministic-rules-over-recorded-evidence.md)):
+    - Workshop runs, regression tasks and suite runs get their executable from `prepare_run`, which
+      asks the manager.
+    - A suite run pins one managed executable for all its entries.
+    - The executor refuses to launch a program whose hash differs from the recorded
+      `binary_sha256`.
+    - Suite comparisons warn on a different or unknown `agent_revision`. Fixtures that expect
+      "directly comparable" must therefore record a runtime, just as they record the model and agent
+      version.
 - **Owner:** `team`
 - **Links:** `src-tauri/src/core/stack_agent_runtime/`, `src-tauri/src/core/agent_bench/commands.rs`,
   `web-app/src/containers/agent-bench/RuntimePanel.tsx`, `docs/agent-bench.md`,

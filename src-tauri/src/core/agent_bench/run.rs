@@ -106,6 +106,11 @@ pub struct ExecutionRecord {
     pub agent_report: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// When the agent process started and ended (absent in older records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +136,9 @@ pub struct CheckResult {
     pub stderr: CapturedText,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// When the check started (absent in older records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,6 +286,26 @@ pub struct RunRecord {
     /// Status changes in order, each with when it happened.
     #[serde(default)]
     pub history: Vec<StatusChange>,
+    // ---- added after v1 shipped; absent in older records ----
+    /// The starting state the attempt was made from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<super::baseline::Baseline>,
+    /// The agent's own trajectory and replies, as its adapter read them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_trace: Option<super::evidence::AgentTrace>,
+    /// Why the run did not succeed, as far as the evidence shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<super::analysis::FailureAnalysis>,
+    /// The regression-suite run this run belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suite: Option<SuiteRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SuiteRef {
+    pub suite_id: String,
+    pub suite_version: u32,
+    pub suite_run_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -308,7 +336,27 @@ impl RunRecord {
             self.finish(&at);
         }
         self.history.push(StatusChange { status: next, at });
+        if next.is_terminal() {
+            self.reanalyze();
+        }
         Ok(())
+    }
+
+    /// Recomputes the failure analysis once there is an outcome to analyze
+    /// (or a review to wait for), keeping any human causes and suggestions.
+    pub fn reanalyze(&mut self) {
+        if self.status.is_terminal() || self.evaluation.awaiting_review {
+            self.analysis = Some(super::analysis::analyze(self));
+        }
+    }
+
+    /// The record with an analysis, computing one for a record written before
+    /// analyses existed. Nothing is saved.
+    pub fn with_analysis(mut self) -> Self {
+        if self.analysis.is_none() {
+            self.reanalyze();
+        }
+        self
     }
 
     fn finish(&mut self, at: &str) {
@@ -370,6 +418,8 @@ impl RunRecord {
             };
             self.failure_kind = failure;
             self.transition(status)?;
+        } else {
+            self.reanalyze();
         }
         Ok(())
     }
@@ -385,6 +435,10 @@ impl RunRecord {
         for c in &mut s.verification {
             c.stdout.text.clear();
             c.stderr.text.clear();
+        }
+        if let Some(t) = s.agent_trace.as_mut() {
+            t.events.clear();
+            t.replies.clear();
         }
         s
     }

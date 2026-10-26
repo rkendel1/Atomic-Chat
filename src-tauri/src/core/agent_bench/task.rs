@@ -43,6 +43,67 @@ pub struct BenchTask {
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
+    /// Where the task came from, for a task made from an earlier run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<TaskOrigin>,
+    /// The outcome a run of this task is expected to reach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<ExpectedOutcome>,
+}
+
+/// The run a regression task was made from. Copied, never linked: the source
+/// task and run stay as they were.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskOrigin {
+    /// `regression` (made from a run).
+    pub kind: String,
+    pub source_run_id: String,
+    pub source_task_id: String,
+    pub source_task_version: u32,
+    pub source_task_digest: String,
+    /// The source run's status and verified outcome, as recorded.
+    pub source_status: String,
+    #[serde(default)]
+    pub source_verified: Option<String>,
+    /// The source run's checks and what each did.
+    #[serde(default)]
+    pub source_checks: Vec<OriginCheck>,
+    /// The source run's primary failure category, if one was established.
+    #[serde(default)]
+    pub source_primary_cause: Option<String>,
+    /// The agent, version and model of the source run.
+    pub source_agent: String,
+    #[serde(default)]
+    pub source_agent_version: Option<String>,
+    #[serde(default)]
+    pub source_model: Option<String>,
+    /// The source run's starting state.
+    #[serde(default)]
+    pub source_baseline: Option<String>,
+    /// A person's short description of the failure.
+    pub failure_description: String,
+    /// What a person thinks would fix it, if they said.
+    #[serde(default)]
+    pub proposed_improvement: String,
+    pub created_at: String,
+    /// What this regression cannot reproduce exactly.
+    #[serde(default)]
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OriginCheck {
+    pub name: String,
+    pub outcome: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExpectedOutcome {
+    /// `success`: every check passes (the failure is fixed).
+    /// `failure`: the checks keep failing (a known, accepted failure).
+    pub outcome: String,
+    #[serde(default)]
+    pub note: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,6 +114,10 @@ pub enum WorkdirRef {
     Fixture { fixture: String },
     /// A project on disk. The agent works in place and its changes are kept.
     Path { path: String },
+    /// One commit of a local git repository: its tracked files (credential-
+    /// shaped paths left out) in a fresh workspace for every run. The
+    /// repository itself is never changed.
+    GitSnapshot { repo: String, commit: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,6 +230,22 @@ impl BenchTask {
                     return Err("the project directory must be an absolute path".to_string());
                 }
             }
+            WorkdirRef::GitSnapshot { repo, commit } => {
+                if !std::path::Path::new(repo).is_absolute() {
+                    return Err("the repository must be an absolute path".to_string());
+                }
+                if commit.len() < 7
+                    || commit.len() > 64
+                    || !commit.chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    return Err("a snapshot names its commit by its hexadecimal id".to_string());
+                }
+            }
+        }
+        if let Some(e) = &self.expected {
+            if !matches!(e.outcome.as_str(), "success" | "failure") {
+                return Err("the expected outcome is `success` or `failure`".to_string());
+            }
         }
         match &self.evaluation {
             Evaluation::Command {
@@ -226,6 +307,12 @@ impl BenchTask {
             "evaluation": self.evaluation,
             "limits": self.limits,
         });
+        // Added after v1 shipped: only present when set, so a task without it
+        // keeps the digest earlier runs recorded.
+        let mut content = content;
+        if let Some(e) = &self.expected {
+            content["expected"] = serde_json::to_value(e).unwrap_or_default();
+        }
         // serde_json orders object keys, so this text is canonical.
         let text = serde_json::to_string(&content).unwrap_or_default();
         hex::encode(Sha256::digest(text.as_bytes()))

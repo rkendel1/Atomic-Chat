@@ -37,6 +37,17 @@ const EXPECTED_DESKTOP_ONLY = new Set([
   'bench_save_task',
   'bench_start_run',
   'bench_submit_review',
+  'bench_inspect_run',
+  'bench_add_assessment',
+  'bench_create_regression',
+  'bench_list_suites',
+  'bench_create_suite',
+  'bench_add_to_suite',
+  'bench_remove_from_suite',
+  'bench_run_suite',
+  'bench_list_suite_runs',
+  'bench_compare_suite_runs',
+  'bench_failure_summary',
   // The stack-agent runtime manager builds and launches stack-agent, which
   // only Agent Bench and the Launch page's desktop terminal use.
   'stack_agent_runtime_prepare_revision',

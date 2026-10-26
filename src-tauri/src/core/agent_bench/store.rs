@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::regression_suite::{Suite, SuiteRun, SUITE_RUN_SCHEMA, SUITE_SCHEMA};
 use super::run::{RunRecord, RUN_SCHEMA};
 use super::suite;
 use super::task::{is_valid_id, BenchTask, TASK_SCHEMA};
@@ -37,6 +38,19 @@ impl Store {
     }
     pub fn exports_dir(&self) -> PathBuf {
         self.root.join("exports")
+    }
+    /// What an agent records about one run, outside its project.
+    pub fn evidence_dir(&self, run_id: &str) -> PathBuf {
+        self.root.join("evidence").join(run_id)
+    }
+    fn task_versions_dir(&self, id: &str) -> PathBuf {
+        self.root.join("task_versions").join(id)
+    }
+    fn suites_dir(&self) -> PathBuf {
+        self.root.join("suites")
+    }
+    fn suite_runs_dir(&self) -> PathBuf {
+        self.root.join("suite_runs")
     }
 
     // ---- tasks ----------------------------------------------------------
@@ -98,7 +112,56 @@ impl Store {
             }
         }
         write_json(&path, &task)?;
+        self.archive_task_version(&task)?;
         Ok(task)
+    }
+
+    /// Keeps every saved version, write-once, so a suite can pin one and a
+    /// later edit never changes what an earlier run or suite referred to.
+    fn archive_task_version(&self, task: &BenchTask) -> Result<(), String> {
+        let path = self
+            .task_versions_dir(&task.id)
+            .join(format!("v{}.json", task.version));
+        if path.exists() {
+            return Ok(());
+        }
+        write_json(&path, task)
+    }
+
+    /// A task as it was at `version`: a bundled task at its shipped version,
+    /// otherwise the archived copy (or the current one when it is that version).
+    pub fn get_task_version(&self, id: &str, version: u32) -> Result<BenchTask, String> {
+        if let Some(t) = suite::builtin_tasks().into_iter().find(|t| t.id == id) {
+            return if t.version == version {
+                Ok(t)
+            } else {
+                Err(format!(
+                    "{id} v{version} is not this app's bundled version (v{})",
+                    t.version
+                ))
+            };
+        }
+        if !is_valid_id(id) {
+            return Err(format!("invalid task id {id:?}"));
+        }
+        let archived = self.task_versions_dir(id).join(format!("v{version}.json"));
+        if archived.exists() {
+            return read_json(&archived);
+        }
+        match self.get_task(id) {
+            Ok(t) if t.version == version => Ok(t),
+            _ => Err(format!("{id} v{version} is not stored")),
+        }
+    }
+
+    /// Saves a new task that must not exist yet (a regression task).
+    pub fn create_task(&self, task: BenchTask) -> Result<BenchTask, String> {
+        if suite::builtin_tasks().iter().any(|b| b.id == task.id)
+            || self.tasks_dir().join(format!("{}.json", task.id)).exists()
+        {
+            return Err(format!("a task with id {} already exists", task.id));
+        }
+        self.save_task(task)
     }
 
     pub fn delete_task(&self, id: &str) -> Result<(), String> {
@@ -123,6 +186,7 @@ impl Store {
         let mut runs: Vec<RunRecord> = read_all(&self.runs_dir())?
             .into_iter()
             .filter(|r: &RunRecord| r.schema == RUN_SCHEMA)
+            .map(RunRecord::with_analysis)
             .collect();
         runs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(runs)
@@ -132,7 +196,8 @@ impl Store {
         if !is_valid_run_id(id) {
             return Err(format!("invalid run id {id:?}"));
         }
-        read_json(&self.runs_dir().join(format!("{id}.json")))
+        read_json::<RunRecord>(&self.runs_dir().join(format!("{id}.json")))
+            .map(RunRecord::with_analysis)
     }
 
     pub fn save_run(&self, run: &RunRecord) -> Result<(), String> {
@@ -154,6 +219,76 @@ impl Store {
         }
         Ok(recovered)
     }
+}
+
+impl Store {
+    // ---- regression suites ------------------------------------------------
+
+    pub fn list_suites(&self) -> Result<Vec<Suite>, String> {
+        let mut out: Vec<Suite> = read_all(&self.suites_dir())?
+            .into_iter()
+            .filter(|s: &Suite| s.schema == SUITE_SCHEMA)
+            .collect();
+        out.sort_by_key(|s| s.name.to_lowercase());
+        Ok(out)
+    }
+
+    pub fn get_suite(&self, id: &str) -> Result<Suite, String> {
+        if !is_valid_id(id) {
+            return Err(format!("invalid suite id {id:?}"));
+        }
+        read_json(&self.suites_dir().join(format!("{id}.json")))
+    }
+
+    pub fn save_suite(&self, suite: &Suite) -> Result<(), String> {
+        if !is_valid_id(&suite.id) {
+            return Err(format!("invalid suite id {:?}", suite.id));
+        }
+        write_json(&self.suites_dir().join(format!("{}.json", suite.id)), suite)?;
+        // Each version is kept, so a suite run can show what it ran against.
+        let archived = self
+            .suites_dir()
+            .join("versions")
+            .join(&suite.id)
+            .join(format!("v{}.json", suite.version));
+        if !archived.exists() {
+            write_json(&archived, suite)?;
+        }
+        Ok(())
+    }
+
+    pub fn list_suite_runs(&self, suite_id: Option<&str>) -> Result<Vec<SuiteRun>, String> {
+        let mut out: Vec<SuiteRun> = read_all(&self.suite_runs_dir())?
+            .into_iter()
+            .filter(|r: &SuiteRun| r.schema == SUITE_RUN_SCHEMA)
+            .filter(|r| suite_id.map_or(true, |id| r.suite_id == id))
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(out)
+    }
+
+    pub fn get_suite_run(&self, id: &str) -> Result<SuiteRun, String> {
+        if !is_valid_suite_run_id(id) {
+            return Err(format!("invalid suite run id {id:?}"));
+        }
+        read_json(&self.suite_runs_dir().join(format!("{id}.json")))
+    }
+
+    pub fn save_suite_run(&self, run: &SuiteRun) -> Result<(), String> {
+        if !is_valid_suite_run_id(&run.id) {
+            return Err(format!("invalid suite run id {:?}", run.id));
+        }
+        write_json(&self.suite_runs_dir().join(format!("{}.json", run.id)), run)
+    }
+}
+
+pub fn is_valid_suite_run_id(id: &str) -> bool {
+    id.strip_prefix("suiterun_")
+        .is_some_and(|rest| is_valid_run_id(&format!("run_{rest}")))
+}
+
+pub fn new_suite_run_id() -> String {
+    format!("suiterun_{}", &new_run_id()[4..])
 }
 
 pub fn is_valid_run_id(id: &str) -> bool {
