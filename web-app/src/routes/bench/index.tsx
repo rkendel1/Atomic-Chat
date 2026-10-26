@@ -28,15 +28,22 @@ import { detectIntegrationAgent } from '@/lib/integration-agent-detection'
 import { agentApiUrl } from '@/lib/integration-agent-setup'
 import { startLocalApiServer } from '@/utils/localApiServerControl'
 import { createSafeUnlisten } from '@/lib/tauriEvent'
+import { cn } from '@/lib/utils'
 import { benchApi, RUN_UPDATED_EVENT } from '@/lib/agent-bench/api'
 import type {
   BenchOverview,
   BenchTask,
+  RunConfig,
+  RunInspection,
   RunRecord,
+  WorkshopRun,
 } from '@/lib/agent-bench/types'
 import { TaskEditorDialog } from '@/containers/agent-bench/TaskEditorDialog'
 import { RunHistory } from '@/containers/agent-bench/RunHistory'
-import { RunDetail } from '@/containers/agent-bench/RunDetail'
+import { RunInspector } from '@/containers/agent-bench/RunInspector'
+import { CreateRegressionDialog } from '@/containers/agent-bench/CreateRegressionDialog'
+import { SuitesPanel } from '@/containers/agent-bench/SuitesPanel'
+import { FailuresPanel } from '@/containers/agent-bench/FailuresPanel'
 import { CompareTable } from '@/containers/agent-bench/CompareTable'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -97,8 +104,12 @@ export function AgentBenchPage() {
   const [runningModels, setRunningModels] = useState<string[]>([])
   const [claudeUsesLocal, setClaudeUsesLocal] = useState(true)
   const [starting, setStarting] = useState(false)
-  const [openRun, setOpenRun] = useState<RunRecord | null>(null)
-  const openRunId = openRun?.id ?? null
+  const [inspection, setInspection] = useState<RunInspection | null>(null)
+  const openRunId = inspection?.run.id ?? null
+  const [tab, setTab] = useState<'runs' | 'suites' | 'failures'>('runs')
+  // Bumped on every run change, so the suite and failure views reload.
+  const [refreshKey, setRefreshKey] = useState(0)
+  const [regressionRun, setRegressionRun] = useState<WorkshopRun | null>(null)
   const [compareIds, setCompareIds] = useState<string[]>([])
   const [compareRuns, setCompareRuns] = useState<RunRecord[]>([])
   const [editor, setEditor] = useState<{ initial: BenchTask | null } | null>(
@@ -169,10 +180,11 @@ export function AgentBenchPage() {
     let disposed = false
     listen<string>(RUN_UPDATED_EVENT, (event) => {
       loadRuns()
+      setRefreshKey((k) => k + 1)
       if (event.payload === openRef.current)
         benchApi
-          .getRun(event.payload)
-          .then(setOpenRun)
+          .inspectRun(event.payload)
+          .then(setInspection)
           .catch(() => {})
       if (compareRef.current.includes(event.payload))
         benchApi
@@ -193,7 +205,16 @@ export function AgentBenchPage() {
 
   const open = async (id: string) => {
     try {
-      setOpenRun(await benchApi.getRun(id))
+      setInspection(await benchApi.inspectRun(id))
+      setTab('runs')
+    } catch (err) {
+      toast.error(String(err))
+    }
+  }
+
+  const startRegression = async (runId: string) => {
+    try {
+      setRegressionRun((await benchApi.inspectRun(runId)).run)
     } catch (err) {
       toast.error(String(err))
     }
@@ -221,36 +242,41 @@ export function AgentBenchPage() {
     setServerStatus('running')
   }
 
+  /** One agent's run settings, from the Run panel; starts the server if needed. */
+  const buildConfig = async (agentId: string): Promise<RunConfig> => {
+    const adapter = overview?.adapters.find((a) => a.id === agentId)
+    const useLocal = agentId !== 'claude-code' || claudeUsesLocal
+    if (adapter?.requires_endpoint || (agentId === 'claude-code' && useLocal))
+      await ensureServerRunning()
+    const agent = INTEGRATION_AGENTS.find((a) => a.id === agentId)
+    return {
+      agent_id: agentId,
+      model: model.trim() || null,
+      api_url:
+        agent && useLocal
+          ? agentApiUrl(agent, { serverHost, serverPort, apiPrefix, apiKey })
+          : null,
+      api_key: useLocal ? apiKey || null : null,
+      executable: customPaths[agentId] || binPath[agentId] || null,
+    }
+  }
+
   const run = async () => {
     if (!task) return
     setStarting(true)
     try {
       const adapters =
         overview?.adapters.filter((a) => agentIds.includes(a.id)) ?? []
-      const needsServer = adapters.some(
-        (a) =>
-          a.requires_endpoint || (a.id === 'claude-code' && claudeUsesLocal)
-      )
-      if (needsServer) await ensureServerRunning()
       let first: RunRecord | null = null
       // One after another: the Rust side queues them and runs one at a time.
       for (const adapter of adapters) {
-        const agent = INTEGRATION_AGENTS.find((a) => a.id === adapter.id)
-        const useLocal = adapter.id !== 'claude-code' || claudeUsesLocal
-        const apiUrl =
-          agent && useLocal
-            ? agentApiUrl(agent, { serverHost, serverPort, apiPrefix, apiKey })
-            : null
-        const record = await benchApi.startRun(task.id, {
-          agent_id: adapter.id,
-          model: model.trim() || null,
-          api_url: apiUrl,
-          api_key: useLocal ? apiKey || null : null,
-          executable: customPaths[adapter.id] || binPath[adapter.id] || null,
-        })
+        const record = await benchApi.startRun(
+          task.id,
+          await buildConfig(adapter.id)
+        )
         first ??= record
       }
-      if (first) setOpenRun(first)
+      if (first) await open(first.id)
       await loadRuns()
     } catch (err) {
       toast.error(t('bench:run.failedToStart'), { description: String(err) })
@@ -321,266 +347,375 @@ export function AgentBenchPage() {
             </p>
           )}
 
-          <Section
-            title={t('bench:task.title')}
-            description={t('bench:task.description')}
-            actions={
-              <div className="flex gap-1">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setEditor({ initial: null })}
-                >
-                  <IconPlus size={14} />
-                  {t('bench:task.new')}
-                </Button>
-                {task && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() =>
-                      setEditor({ initial: { ...task, builtin: true } })
-                    }
-                  >
-                    <IconCopy size={14} />
-                    {t('bench:task.duplicate')}
-                  </Button>
+          <div role="tablist" className="flex gap-1 border-b">
+            {(['runs', 'suites', 'failures'] as const).map((k) => (
+              <button
+                key={k}
+                role="tab"
+                aria-selected={tab === k}
+                onClick={() => setTab(k)}
+                className={cn(
+                  '-mb-px border-b-2 px-3 py-1.5 text-sm',
+                  tab === k
+                    ? 'border-foreground font-medium'
+                    : 'border-transparent text-muted-foreground'
                 )}
-                {task && !task.builtin && (
-                  <>
+              >
+                {t(`bench:tabs.${k}`)}
+              </button>
+            ))}
+          </div>
+
+          {tab === 'suites' && (
+            <Section
+              title={t('bench:suites.title')}
+              description={t('bench:suites.description')}
+            >
+              <Card className="rounded-lg bg-card">
+                <SuitesPanel
+                  adapters={overview?.adapters ?? []}
+                  currentTask={task}
+                  refreshKey={refreshKey}
+                  buildConfig={buildConfig}
+                  onOpenRun={open}
+                />
+              </Card>
+            </Section>
+          )}
+
+          {tab === 'failures' && (
+            <Section
+              title={t('bench:failures.title')}
+              description={t('bench:failures.description')}
+            >
+              <Card className="rounded-lg bg-card">
+                <FailuresPanel
+                  adapters={overview?.adapters ?? []}
+                  refreshKey={refreshKey}
+                  onOpenRun={open}
+                  onCreateRegression={startRegression}
+                />
+              </Card>
+            </Section>
+          )}
+
+          {tab === 'runs' && (
+            <>
+              <Section
+                title={t('bench:task.title')}
+                description={t('bench:task.description')}
+                actions={
+                  <div className="flex gap-1">
                     <Button
                       variant="ghost"
                       size="sm"
-                      onClick={() => setEditor({ initial: task })}
+                      onClick={() => setEditor({ initial: null })}
                     >
-                      <IconEdit size={14} />
-                      {t('bench:task.edit')}
+                      <IconPlus size={14} />
+                      {t('bench:task.new')}
                     </Button>
-                    <Button variant="ghost" size="sm" onClick={deleteTask}>
-                      <IconTrash size={14} />
-                    </Button>
-                  </>
-                )}
-              </div>
-            }
-          >
-            <Card className="rounded-lg bg-card">
-              <select
-                aria-label={t('bench:task.select')}
-                className="h-9 w-full rounded-md border bg-background px-2 text-sm"
-                value={taskId}
-                onChange={(e) => setTaskId(e.target.value)}
-              >
-                {tasks.map((x) => (
-                  <option key={x.id} value={x.id}>
-                    {x.builtin ? `★ ${x.name}` : x.name} (v{x.version})
-                  </option>
-                ))}
-              </select>
-              {task && (
-                <div className="mt-3 flex flex-col gap-2 text-sm">
-                  {task.description && (
-                    <p className="text-muted-foreground">{task.description}</p>
-                  )}
-                  <p className="whitespace-pre-wrap">{task.goal}</p>
-                  {task.success_criteria.length > 0 && (
-                    <ul className="list-disc pl-5 text-xs text-muted-foreground">
-                      {task.success_criteria.map((c, i) => (
-                        <li key={i}>{c}</li>
-                      ))}
-                    </ul>
-                  )}
-                  <div className="text-xs">
-                    <span className="text-muted-foreground">
-                      {t('bench:task.project')}:{' '}
-                    </span>
-                    {task.workdir.kind === 'fixture'
-                      ? t('bench:task.fixture', {
-                          fixture: task.workdir.fixture,
-                        })
-                      : task.workdir.path}
-                  </div>
-                  <div className="text-xs">
-                    <span className="text-muted-foreground">
-                      {t('bench:task.evaluation')}:{' '}
-                    </span>
-                    {evaluation?.method === 'manual'
-                      ? t('bench:method.manual')
-                      : t('bench:method.command')}
-                  </div>
-                  {evaluation?.method === 'command' && (
-                    <ul className="flex flex-col gap-0.5 text-xs">
-                      {evaluation.commands.map((c, i) => (
-                        <li key={i}>
-                          {c.name}:{' '}
-                          <code className="rounded bg-muted px-1 text-[11px]">
-                            {[c.program, ...c.args].join(' ')}
-                          </code>
-                        </li>
-                      ))}
-                      {evaluation.held_out_checks && (
-                        <li className="text-muted-foreground">
-                          {t('bench:task.heldOut', {
-                            set: evaluation.held_out_checks,
-                          })}
-                        </li>
-                      )}
-                    </ul>
-                  )}
-                  <div className="text-xs text-muted-foreground">
-                    {t('bench:task.limits', {
-                      timeout: task.limits.timeout_secs ?? 900,
-                      turns:
-                        task.limits.max_turns ?? t('bench:editor.agentDefault'),
-                    })}
-                  </div>
-                </div>
-              )}
-            </Card>
-          </Section>
-
-          <Section
-            title={t('bench:run.title')}
-            description={t('bench:run.description')}
-          >
-            <Card className="rounded-lg bg-card">
-              <div className="flex flex-col gap-3 text-sm">
-                <div className="flex flex-col gap-1">
-                  <span className="text-xs font-medium text-muted-foreground">
-                    {t('bench:run.agents')}
-                  </span>
-                  {adapters.map((a) => (
-                    <label key={a.id} className="flex items-start gap-2">
-                      <input
-                        type="checkbox"
-                        className="mt-1"
-                        checked={agentIds.includes(a.id)}
-                        onChange={() =>
-                          setAgentIds((ids) =>
-                            ids.includes(a.id)
-                              ? ids.filter((x) => x !== a.id)
-                              : [...ids, a.id]
-                          )
+                    {task && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() =>
+                          setEditor({ initial: { ...task, builtin: true } })
                         }
+                      >
+                        <IconCopy size={14} />
+                        {t('bench:task.duplicate')}
+                      </Button>
+                    )}
+                    {task && !task.builtin && (
+                      <>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setEditor({ initial: task })}
+                        >
+                          <IconEdit size={14} />
+                          {t('bench:task.edit')}
+                        </Button>
+                        <Button variant="ghost" size="sm" onClick={deleteTask}>
+                          <IconTrash size={14} />
+                        </Button>
+                      </>
+                    )}
+                  </div>
+                }
+              >
+                <Card className="rounded-lg bg-card">
+                  <select
+                    aria-label={t('bench:task.select')}
+                    className="h-9 w-full rounded-md border bg-background px-2 text-sm"
+                    value={taskId}
+                    onChange={(e) => setTaskId(e.target.value)}
+                  >
+                    {tasks.map((x) => (
+                      <option key={x.id} value={x.id}>
+                        {x.builtin ? `★ ${x.name}` : x.name} (v{x.version})
+                      </option>
+                    ))}
+                  </select>
+                  {task && (
+                    <div className="mt-3 flex flex-col gap-2 text-sm">
+                      {task.description && (
+                        <p className="text-muted-foreground">
+                          {task.description}
+                        </p>
+                      )}
+                      <p className="whitespace-pre-wrap">{task.goal}</p>
+                      {task.success_criteria.length > 0 && (
+                        <ul className="list-disc pl-5 text-xs text-muted-foreground">
+                          {task.success_criteria.map((c, i) => (
+                            <li key={i}>{c}</li>
+                          ))}
+                        </ul>
+                      )}
+                      <div className="text-xs">
+                        <span className="text-muted-foreground">
+                          {t('bench:task.project')}:{' '}
+                        </span>
+                        {task.workdir.kind === 'fixture'
+                          ? t('bench:task.fixture', {
+                              fixture: task.workdir.fixture,
+                            })
+                          : task.workdir.kind === 'git_snapshot'
+                            ? t('bench:task.snapshot', {
+                                commit: task.workdir.commit.slice(0, 12),
+                                repo: task.workdir.repo,
+                              })
+                            : t('bench:task.inPlace', {
+                                path: task.workdir.path,
+                              })}
+                      </div>
+                      {task.origin && (
+                        <div className="rounded-md bg-muted px-2 py-1 text-xs">
+                          {t('bench:task.origin', {
+                            run: task.origin.source_run_id,
+                            task: task.origin.source_task_id,
+                            version: task.origin.source_task_version,
+                          })}
+                          {' — '}
+                          {task.origin.failure_description}
+                          {task.origin.proposed_improvement && (
+                            <span className="block text-muted-foreground">
+                              {t('bench:task.improvement')}:{' '}
+                              {task.origin.proposed_improvement}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {task.expected && (
+                        <div className="text-xs">
+                          <span className="text-muted-foreground">
+                            {t('bench:task.expected')}:{' '}
+                          </span>
+                          {t(`bench:verdict.${task.expected.outcome}`)}
+                        </div>
+                      )}
+                      <div className="text-xs">
+                        <span className="text-muted-foreground">
+                          {t('bench:task.evaluation')}:{' '}
+                        </span>
+                        {evaluation?.method === 'manual'
+                          ? t('bench:method.manual')
+                          : t('bench:method.command')}
+                      </div>
+                      {evaluation?.method === 'command' && (
+                        <ul className="flex flex-col gap-0.5 text-xs">
+                          {evaluation.commands.map((c, i) => (
+                            <li key={i}>
+                              {c.name}:{' '}
+                              <code className="rounded bg-muted px-1 text-[11px]">
+                                {[c.program, ...c.args].join(' ')}
+                              </code>
+                            </li>
+                          ))}
+                          {evaluation.held_out_checks && (
+                            <li className="text-muted-foreground">
+                              {t('bench:task.heldOut', {
+                                set: evaluation.held_out_checks,
+                              })}
+                            </li>
+                          )}
+                        </ul>
+                      )}
+                      <div className="text-xs text-muted-foreground">
+                        {t('bench:task.limits', {
+                          timeout: task.limits.timeout_secs ?? 900,
+                          turns:
+                            task.limits.max_turns ??
+                            t('bench:editor.agentDefault'),
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </Card>
+              </Section>
+
+              <Section
+                title={t('bench:run.title')}
+                description={t('bench:run.description')}
+              >
+                <Card className="rounded-lg bg-card">
+                  <div className="flex flex-col gap-3 text-sm">
+                    <div className="flex flex-col gap-1">
+                      <span className="text-xs font-medium text-muted-foreground">
+                        {t('bench:run.agents')}
+                      </span>
+                      {adapters.map((a) => (
+                        <label key={a.id} className="flex items-start gap-2">
+                          <input
+                            type="checkbox"
+                            className="mt-1"
+                            checked={agentIds.includes(a.id)}
+                            onChange={() =>
+                              setAgentIds((ids) =>
+                                ids.includes(a.id)
+                                  ? ids.filter((x) => x !== a.id)
+                                  : [...ids, a.id]
+                              )
+                            }
+                          />
+                          <span className="min-w-0">
+                            <span className="font-medium">{a.name}</span>{' '}
+                            <span className="text-xs text-muted-foreground">
+                              {installed[a.id] === undefined
+                                ? ''
+                                : installed[a.id]
+                                  ? t('bench:run.installed')
+                                  : t('bench:run.notInstalled')}
+                            </span>
+                            <span className="block text-xs text-muted-foreground">
+                              {a.notes}
+                            </span>
+                            {a.id === 'claude-code' &&
+                              agentIds.includes(a.id) && (
+                                <label className="mt-1 flex items-center gap-2 text-xs">
+                                  <input
+                                    type="checkbox"
+                                    checked={claudeUsesLocal}
+                                    onChange={(e) =>
+                                      setClaudeUsesLocal(e.target.checked)
+                                    }
+                                  />
+                                  {t('bench:run.claudeUsesLocal')}
+                                </label>
+                              )}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                    <label className="flex flex-col gap-1">
+                      <span className="text-xs font-medium text-muted-foreground">
+                        {t('bench:run.model')}
+                      </span>
+                      <Input
+                        list="bench-models"
+                        value={model}
+                        placeholder={t('bench:run.modelPlaceholder')}
+                        onChange={(e) => setModel(e.target.value)}
                       />
-                      <span className="min-w-0">
-                        <span className="font-medium">{a.name}</span>{' '}
-                        <span className="text-xs text-muted-foreground">
-                          {installed[a.id] === undefined
-                            ? ''
-                            : installed[a.id]
-                              ? t('bench:run.installed')
-                              : t('bench:run.notInstalled')}
-                        </span>
-                        <span className="block text-xs text-muted-foreground">
-                          {a.notes}
-                        </span>
-                        {a.id === 'claude-code' && agentIds.includes(a.id) && (
-                          <label className="mt-1 flex items-center gap-2 text-xs">
-                            <input
-                              type="checkbox"
-                              checked={claudeUsesLocal}
-                              onChange={(e) =>
-                                setClaudeUsesLocal(e.target.checked)
-                              }
-                            />
-                            {t('bench:run.claudeUsesLocal')}
-                          </label>
-                        )}
+                      <datalist id="bench-models">
+                        {modelOptions.map((m) => (
+                          <option key={m} value={m} />
+                        ))}
+                      </datalist>
+                      <span className="text-[11px] text-muted-foreground">
+                        {serverStatus === 'running'
+                          ? t('bench:run.serverRunning', {
+                              url: `http://${serverHost}:${serverPort}${apiPrefix}`,
+                            })
+                          : t('bench:run.serverStopped')}
                       </span>
                     </label>
-                  ))}
-                </div>
-                <label className="flex flex-col gap-1">
-                  <span className="text-xs font-medium text-muted-foreground">
-                    {t('bench:run.model')}
-                  </span>
-                  <Input
-                    list="bench-models"
-                    value={model}
-                    placeholder={t('bench:run.modelPlaceholder')}
-                    onChange={(e) => setModel(e.target.value)}
-                  />
-                  <datalist id="bench-models">
-                    {modelOptions.map((m) => (
-                      <option key={m} value={m} />
-                    ))}
-                  </datalist>
-                  <span className="text-[11px] text-muted-foreground">
-                    {serverStatus === 'running'
-                      ? t('bench:run.serverRunning', {
-                          url: `http://${serverHost}:${serverPort}${apiPrefix}`,
-                        })
-                      : t('bench:run.serverStopped')}
-                  </span>
-                </label>
-                <div className="flex items-center gap-2">
-                  <Button onClick={run} disabled={!canRun}>
-                    {starting ? (
-                      <IconLoader2 size={14} className="animate-spin" />
-                    ) : (
-                      <IconPlayerPlay size={14} />
-                    )}
-                    {agentIds.length > 1
-                      ? t('bench:run.runEach', { count: agentIds.length })
-                      : t('bench:run.run')}
-                  </Button>
-                  {needsModel && !model.trim() && (
-                    <span className="text-xs text-amber-600">
-                      {t('bench:run.needsModel')}
-                    </span>
-                  )}
-                </div>
-              </div>
-            </Card>
-          </Section>
+                    <div className="flex items-center gap-2">
+                      <Button onClick={run} disabled={!canRun}>
+                        {starting ? (
+                          <IconLoader2 size={14} className="animate-spin" />
+                        ) : (
+                          <IconPlayerPlay size={14} />
+                        )}
+                        {agentIds.length > 1
+                          ? t('bench:run.runEach', { count: agentIds.length })
+                          : t('bench:run.run')}
+                      </Button>
+                      {needsModel && !model.trim() && (
+                        <span className="text-xs text-amber-600">
+                          {t('bench:run.needsModel')}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </Card>
+              </Section>
 
-          {openRun && (
-            <Section title={t('bench:detail.title')}>
-              <Card className="rounded-lg bg-card">
-                <RunDetail run={openRun} onChanged={() => open(openRun.id)} />
-              </Card>
-            </Section>
-          )}
+              {inspection && (
+                <Section title={t('bench:inspector.title')}>
+                  <Card className="rounded-lg bg-card">
+                    <RunInspector
+                      inspection={inspection}
+                      onChanged={() => open(inspection.run.id)}
+                      onCreateRegression={() =>
+                        setRegressionRun(inspection.run)
+                      }
+                    />
+                  </Card>
+                </Section>
+              )}
 
-          {compareRuns.length > 1 && (
-            <Section
-              title={t('bench:compare.title')}
-              actions={
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    setCompareIds([])
-                    setCompareRuns([])
-                  }}
+              {compareRuns.length > 1 && (
+                <Section
+                  title={t('bench:compare.title')}
+                  actions={
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setCompareIds([])
+                        setCompareRuns([])
+                      }}
+                    >
+                      {t('bench:compare.clear')}
+                    </Button>
+                  }
                 >
-                  {t('bench:compare.clear')}
-                </Button>
-              }
-            >
-              <Card className="rounded-lg bg-card">
-                <CompareTable runs={compareRuns} />
-              </Card>
-            </Section>
-          )}
+                  <Card className="rounded-lg bg-card">
+                    <CompareTable runs={compareRuns} />
+                  </Card>
+                </Section>
+              )}
 
-          <Section
-            title={t('bench:history.title')}
-            description={t('bench:history.description')}
-          >
-            <RunHistory
-              runs={runs}
-              openRunId={openRunId}
-              compareIds={compareIds}
-              onOpen={open}
-              onToggleCompare={(id) => {
-                toggleCompare(id).catch((err) => toast.error(String(err)))
-              }}
-            />
-          </Section>
+              <Section
+                title={t('bench:history.title')}
+                description={t('bench:history.description')}
+              >
+                <RunHistory
+                  runs={runs}
+                  openRunId={openRunId}
+                  compareIds={compareIds}
+                  onOpen={open}
+                  onToggleCompare={(id) => {
+                    toggleCompare(id).catch((err) => toast.error(String(err)))
+                  }}
+                />
+              </Section>
+            </>
+          )}
         </div>
       </div>
+
+      <CreateRegressionDialog
+        run={regressionRun}
+        onClose={() => setRegressionRun(null)}
+        onCreated={async (created) => {
+          setRegressionRun(null)
+          await loadTasks()
+          setTaskId(created.id)
+          setTab('runs')
+        }}
+      />
 
       <TaskEditorDialog
         open={!!editor}

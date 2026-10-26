@@ -113,7 +113,85 @@ pub fn export_line(run: &RunRecord) -> Value {
         "human": run.evaluation.human,
         "agent_claims": agent_claims(run),
         "unknown": unknown,
+        // ---- added within v1 (absent from lines written before) ----
+        // The failure analysis: candidate causes with source, confidence and
+        // evidence, unknowns, and (apart) suggestions, which are never causes.
+        "analysis": run.analysis.clone().or_else(|| run.clone().with_analysis().analysis),
+        "reproducibility": reproducibility(run),
+        "suite": run.suite,
+        "agent_trace": agent_trace(run),
+        "evidence_gaps": evidence_gaps(run),
     })
+}
+
+fn reproducibility(run: &RunRecord) -> Value {
+    let origin = run.task.snapshot.origin.as_ref();
+    let mut limitations: Vec<String> = run
+        .baseline
+        .as_ref()
+        .map(|b| b.limitations.clone())
+        .unwrap_or_default();
+    if let Some(o) = origin {
+        limitations.extend(o.limitations.iter().cloned());
+    }
+    json!({
+        "baseline": run.baseline,
+        "fresh_workspace": run.baseline.as_ref().map(|b| b.fresh_workspace),
+        "task_origin": origin,
+        "task_expected": run.task.snapshot.expected,
+        "limitations": limitations,
+    })
+}
+
+/// The agent's trajectory without each event's raw data: kind, time,
+/// provenance and a one-line summary.
+fn agent_trace(run: &RunRecord) -> Value {
+    let Some(t) = run.agent_trace.as_ref() else {
+        return Value::Null;
+    };
+    let mut by: std::collections::BTreeMap<String, usize> = Default::default();
+    for e in &t.events {
+        let k = serde_json::to_value(e.provenance)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        *by.entry(k).or_insert(0) += 1;
+    }
+    json!({
+        "source": t.source,
+        "available": t.available,
+        "unavailable_reason": t.unavailable_reason,
+        "events_by_provenance": by,
+        "events": t.events.iter().map(|e| json!({
+            "index": e.index, "at": e.at, "provenance": e.provenance,
+            "kind": e.kind, "summary": e.summary,
+        })).collect::<Vec<_>>(),
+        "model_replies": t.replies.len(),
+        "replies_unavailable_reason": t.replies_unavailable_reason,
+    })
+}
+
+/// Evidence this run lacks, by name, so an analysis can tell "absent" from
+/// "not applicable".
+fn evidence_gaps(run: &RunRecord) -> Vec<&'static str> {
+    let mut gaps = Vec::new();
+    if run.baseline.is_none() {
+        gaps.push("baseline");
+    }
+    match &run.agent_trace {
+        None => gaps.push("agent_trace"),
+        Some(t) if !t.available => gaps.push("agent_trace"),
+        Some(t) if t.replies.is_empty() => gaps.push("model_replies"),
+        _ => {}
+    }
+    if run
+        .execution
+        .as_ref()
+        .is_some_and(|e| e.started_at.is_none())
+    {
+        gaps.push("process_timestamps");
+    }
+    gaps
 }
 
 /// The few self-reported fields worth keeping, labelled as the agent's claims.
@@ -129,6 +207,7 @@ fn agent_claims(run: &RunRecord) -> Value {
             "outcome_reason": report["outcome_reason"],
             "paths_written": report["paths_written"],
             "usage": report["usage"],
+            "model_replies": run.agent_trace.as_ref().map(|t| t.replies.clone()),
         }),
         "claude-code" => json!({
             "is_error": report["is_error"],

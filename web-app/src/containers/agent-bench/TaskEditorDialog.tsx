@@ -55,7 +55,11 @@ export function TaskEditorDialog({
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [goal, setGoal] = useState('')
-  const [workdirKind, setWorkdirKind] = useState<'fixture' | 'path'>('path')
+  const [workdirKind, setWorkdirKind] = useState<
+    'fixture' | 'path' | 'git_snapshot'
+  >('path')
+  const [repo, setRepo] = useState('')
+  const [commit, setCommit] = useState('')
   const [fixture, setFixture] = useState('')
   const [path, setPath] = useState('')
   const [criteria, setCriteria] = useState('')
@@ -81,6 +85,8 @@ export function TaskEditorDialog({
         : (fixtures[0] ?? '')
     )
     setPath(src?.workdir.kind === 'path' ? src.workdir.path : '')
+    setRepo(src?.workdir.kind === 'git_snapshot' ? src.workdir.repo : '')
+    setCommit(src?.workdir.kind === 'git_snapshot' ? src.workdir.commit : '')
     setCriteria((src?.success_criteria ?? []).join('\n'))
     setMethod(src?.evaluation.method ?? 'command')
     setCommands(
@@ -141,7 +147,9 @@ export function TaskEditorDialog({
       workdir:
         workdirKind === 'fixture'
           ? { kind: 'fixture', fixture }
-          : { kind: 'path', path: path.trim() },
+          : workdirKind === 'git_snapshot'
+            ? { kind: 'git_snapshot', repo: repo.trim(), commit: commit.trim() }
+            : { kind: 'path', path: path.trim() },
       success_criteria: criteria
         .split('\n')
         .map((c) => c.trim())
@@ -164,6 +172,10 @@ export function TaskEditorDialog({
       builtin: false,
       created_at: editing ? initial!.created_at : '',
       updated_at: editing ? initial!.updated_at : '',
+      // A regression task keeps where it came from when edited; a copy keeps
+      // only what it is expected to do.
+      ...(editing && initial?.origin ? { origin: initial.origin } : {}),
+      ...(initial?.expected ? { expected: initial.expected } : {}),
     }
     setSaving(true)
     try {
@@ -235,15 +247,35 @@ export function TaskEditorDialog({
                 className="h-9 rounded-md border bg-background px-2"
                 value={workdirKind}
                 onChange={(e) =>
-                  setWorkdirKind(e.target.value as 'fixture' | 'path')
+                  setWorkdirKind(
+                    e.target.value as 'fixture' | 'path' | 'git_snapshot'
+                  )
                 }
               >
                 <option value="path">{t('bench:editor.projectFolder')}</option>
+                <option value="git_snapshot">
+                  {t('bench:editor.projectSnapshot')}
+                </option>
                 <option value="fixture">
                   {t('bench:editor.projectFixture')}
                 </option>
               </select>
-              {workdirKind === 'path' ? (
+              {workdirKind === 'git_snapshot' ? (
+                <>
+                  <Input
+                    className="flex-1"
+                    value={repo}
+                    placeholder="/path/to/repository"
+                    onChange={(e) => setRepo(e.target.value)}
+                  />
+                  <Input
+                    className="w-32 font-mono text-xs"
+                    value={commit}
+                    placeholder={t('bench:editor.commit')}
+                    onChange={(e) => setCommit(e.target.value)}
+                  />
+                </>
+              ) : workdirKind === 'path' ? (
                 <>
                   <Input
                     className="flex-1"
@@ -273,7 +305,9 @@ export function TaskEditorDialog({
             <p className="text-[11px] text-muted-foreground">
               {workdirKind === 'path'
                 ? t('bench:editor.projectFolderHint')
-                : t('bench:editor.projectFixtureHint')}
+                : workdirKind === 'git_snapshot'
+                  ? t('bench:editor.projectSnapshotHint')
+                  : t('bench:editor.projectFixtureHint')}
             </p>
           </div>
 

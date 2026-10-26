@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::evidence::{AgentTrace, Provenance, Signal, SignalKind, TraceEvent};
 use super::task::BenchTask;
 
 /// What the UI sends to start a run. The key is used for this run only and
@@ -93,6 +94,9 @@ pub struct Launch {
     pub timeout: Duration,
     /// Address the run needs reachable before it starts, if any.
     pub preflight_url: Option<String>,
+    /// stack-agent's per-run FeltDB database (`--state-db`), read back with
+    /// `agent-state show` after the run for the agent's own trajectory.
+    pub state_db: Option<PathBuf>,
 }
 
 /// `provider` of a run whose model was served by Atomic Chat's Local API Server.
@@ -122,15 +126,27 @@ fn non_empty(v: &Option<String>) -> Option<&str> {
     v.as_deref().map(str::trim).filter(|s| !s.is_empty())
 }
 
-pub fn plan(task: &BenchTask, cfg: &RunConfig, program: &Path) -> Result<Launch, String> {
+/// `evidence_dir` is the run's own directory in the ledger, outside the
+/// project, for anything the agent records about itself.
+pub fn plan(
+    task: &BenchTask,
+    cfg: &RunConfig,
+    program: &Path,
+    evidence_dir: Option<&Path>,
+) -> Result<Launch, String> {
     match cfg.agent_id.as_str() {
-        "stack-agent" => plan_stack_agent(task, cfg, program),
+        "stack-agent" => plan_stack_agent(task, cfg, program, evidence_dir),
         "claude-code" => plan_claude_code(task, cfg, program),
         other => Err(format!("{other} has no Agent Bench adapter")),
     }
 }
 
-fn plan_stack_agent(task: &BenchTask, cfg: &RunConfig, program: &Path) -> Result<Launch, String> {
+fn plan_stack_agent(
+    task: &BenchTask,
+    cfg: &RunConfig,
+    program: &Path,
+    evidence_dir: Option<&Path>,
+) -> Result<Launch, String> {
     let model = non_empty(&cfg.model).ok_or(
         "stack-agent needs a model: load one in Atomic Chat (or pick one in the run settings) \
          and run again.",
@@ -145,11 +161,21 @@ fn plan_stack_agent(task: &BenchTask, cfg: &RunConfig, program: &Path) -> Result
         "--kind".to_string(),
         "change".to_string(),
         "--json".to_string(),
+        // The model's replies go to stderr: the only record of what it said.
+        "--print-reply".to_string(),
         "--deadline-secs".to_string(),
         deadline.to_string(),
     ];
     let mut config = BTreeMap::new();
     config.insert("kind".to_string(), "change".to_string());
+    config.insert("print_reply".to_string(), "true".to_string());
+    // A database of the run's own, so its trajectory can be read back; without
+    // one stack-agent records into a per-project default the bench cannot name.
+    let state_db = evidence_dir.map(|d| d.join("stack-agent-state.feltdb"));
+    if let Some(db) = &state_db {
+        args.extend(["--state-db".to_string(), db.to_string_lossy().into_owned()]);
+        config.insert("state_db".to_string(), "per-run".to_string());
+    }
     config.insert("deadline_secs".to_string(), deadline.to_string());
     if let Some(turns) = task.limits.max_turns {
         let turns = turns.min(STACK_AGENT_LIMIT_CEILING);
@@ -192,6 +218,7 @@ fn plan_stack_agent(task: &BenchTask, cfg: &RunConfig, program: &Path) -> Result
         config,
         timeout: Duration::from_secs(deadline) + SELF_DEADLINE_GRACE,
         preflight_url: endpoint,
+        state_db,
     })
 }
 
@@ -263,6 +290,7 @@ fn plan_claude_code(task: &BenchTask, cfg: &RunConfig, program: &Path) -> Result
         endpoint,
         config,
         timeout: Duration::from_secs(task.limits.effective_timeout_secs()),
+        state_db: None,
     })
 }
 
@@ -361,4 +389,406 @@ pub fn search_path(bin: &str, path: &str) -> Option<PathBuf> {
             .map(|n| dir.join(n))
             .find(|candidate| candidate.is_file())
     })
+}
+
+// ---- the agent's own evidence --------------------------------------------------
+
+/// How to read the agent's trajectory after its run, or why it cannot be read.
+/// stack-agent: `agent-state show --state-db FILE --task-id ID --json`, its
+/// documented inspection command, with the task id its report names.
+pub fn trace_command(
+    agent_id: &str,
+    launch: &Launch,
+    report: Option<&Value>,
+) -> Result<Vec<String>, String> {
+    match agent_id {
+        "stack-agent" => {
+            let db = launch
+                .state_db
+                .as_ref()
+                .ok_or("the run had no per-run state database")?;
+            let report =
+                report.ok_or("stack-agent printed no report, so its task id is unknown")?;
+            let state = &report["agent_state"];
+            let id = state["task"]["task_id"]
+                .as_str()
+                .or_else(|| state["task_id"].as_str())
+                .or_else(|| state["work_id"].as_str())
+                .ok_or("stack-agent's report names no task id")?;
+            if state["recorded"] == false {
+                return Err(format!(
+                    "stack-agent did not record this work: {}",
+                    state["reason"].as_str().unwrap_or("no reason given")
+                ));
+            }
+            Ok(vec![
+                "agent-state".into(),
+                "show".into(),
+                "--state-db".into(),
+                db.to_string_lossy().into_owned(),
+                "--task-id".into(),
+                id.to_string(),
+                "--json".into(),
+            ])
+        }
+        "claude-code" => Err(
+            "Claude Code's `--output-format json` reports only its final result; this adapter \
+             does not capture its tool calls"
+                .into(),
+        ),
+        other => Err(format!("{other} exposes no trajectory to Agent Bench")),
+    }
+}
+
+pub const STACK_AGENT_TRACE_SOURCE: &str = "stack-agent agent-state show --json";
+
+/// stack-agent's events from `agent-state show --json`, in order, with the
+/// provenance stack-agent gave each one.
+pub fn stack_agent_trace(show: &Value, redactor: &super::redact::Redactor) -> Vec<TraceEvent> {
+    let mut events: Vec<TraceEvent> = show["events"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|e| {
+                    let event = redactor.json(&e["event"]);
+                    let kind = event["kind"].as_str().unwrap_or("unknown").to_string();
+                    TraceEvent {
+                        index: e["index"].as_u64().unwrap_or(0),
+                        at: e["recorded_at_ms"]
+                            .as_i64()
+                            .and_then(chrono::DateTime::from_timestamp_millis)
+                            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+                        provenance: match e["provenance"].as_str() {
+                            Some("host_observed") => Provenance::Observed,
+                            Some("model_inferred") => Provenance::AgentClaim,
+                            _ => Provenance::Runtime,
+                        },
+                        summary: summarize_stack_agent_event(&kind, &event),
+                        kind,
+                        data: event,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    events.sort_by_key(|e| (e.data["attempt"].as_u64().unwrap_or(0), e.index));
+    events
+}
+
+/// One line per event, from its own fields only.
+fn summarize_stack_agent_event(kind: &str, e: &Value) -> String {
+    let s = |k: &str| e[k].as_str().unwrap_or("").to_string();
+    let n = |k: &str| {
+        e[k].as_u64()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into())
+    };
+    match kind {
+        "WorkStarted" => format!(
+            "work started (at most {} turns, {} executions)",
+            n("max_turns"),
+            n("max_executions")
+        ),
+        "CapabilitiesAvailable" => format!("{} capabilities available", n("count")),
+        "CapabilitiesUnavailable" => format!("capabilities unavailable: {}", s("reason")),
+        "DecisionStarted" => format!("turn {} started", n("turn")),
+        "ModelEscalation" => format!("turn {}: asking the model ({})", n("turn"), s("reason")),
+        "LocalDecision" => format!("turn {}: local decision {}", n("turn"), s("decision")),
+        "ModelCalled" => format!(
+            "turn {}: model call {} ({} prompt / {} completion tokens)",
+            n("turn"),
+            if e["succeeded"] == false {
+                "failed"
+            } else {
+                "returned"
+            },
+            n("prompt_tokens"),
+            n("completion_tokens")
+        ),
+        "ContextLimit" => format!("turn {}: context limit reached", n("turn")),
+        "DecisionMade" => format!("turn {}: model decided: {}", n("turn"), s("decision")),
+        "DecisionRejected" => format!("turn {}: decision rejected: {}", n("turn"), s("reason")),
+        "CapabilityRequested" => format!("turn {}: model requested {}", n("turn"), s("capability")),
+        "ExecutionRequested" => format!("execution of {} requested", s("capability")),
+        "ExecutionStarted" => "execution started".to_string(),
+        "ExecutionCompleted" => "execution completed".to_string(),
+        "ExecutionFailed" => format!(
+            "execution failed: {}",
+            failure_code(e).unwrap_or_else(|| s("reason"))
+        ),
+        "ObservationRecorded" => format!("observation recorded ({})", s("observation")),
+        "EvidenceRecorded" => format!("evidence recorded from {}", s("capability")),
+        "GoalEvaluated" => format!(
+            "goal evaluated: {}",
+            if e["satisfied"] == true {
+                "satisfied".to_string()
+            } else {
+                format!("not satisfied ({} remaining)", n("remaining"))
+            }
+        ),
+        "WorkCompleted" => "work completed".to_string(),
+        "WorkEscalated" => format!("work escalated: {}", s("reason")),
+        "WorkBlocked" => format!("work blocked: {}", s("reason")),
+        "WorkLimitReached" => format!("work stopped at the {} limit", s("limit")),
+        "WorkFailed" => format!("work failed: {}", s("reason")),
+        "WorkCancelled" => format!("work cancelled ({}): {}", s("cause"), s("reason")),
+        other => other.to_string(),
+    }
+}
+
+/// The error code of a failed stack-agent execution
+/// (`{"capability":…,"error":"not_a_repository"}` in its reason).
+fn failure_code(e: &Value) -> Option<String> {
+    let reason = e["reason"].as_str()?;
+    let v: Value = serde_json::from_str(reason).ok()?;
+    let cap = v["capability"].as_str().unwrap_or("?");
+    v["error"].as_str().map(|err| format!("{cap}: {err}"))
+}
+
+/// How stack-agent's loop guard begins the reason of a work it blocked.
+const STACK_AGENT_STUCK_PREFIX: &str = "stuck: ";
+
+/// stack-agent's words for a refusal on authority grounds (chip-project's
+/// path policy), as they appear in a rejected decision or failed execution.
+const STACK_AGENT_AUTHORITY_PHRASES: &[&str] = &[
+    "is protected and is never written",
+    "is reserved",
+    "resolves outside the project root",
+];
+
+/// Facts and claims from the agent's report and trajectory, each with where it
+/// came from. Only what the agent recorded; nothing is inferred from prose.
+pub fn signals(agent_id: &str, report: Option<&Value>, trace: Option<&AgentTrace>) -> Vec<Signal> {
+    let mut out = Vec::new();
+    let mut push = |kind: SignalKind, provenance: Provenance, source: &str, detail: String| {
+        out.push(Signal {
+            kind,
+            provenance,
+            source: source.to_string(),
+            detail,
+        })
+    };
+    match agent_id {
+        "stack-agent" => {
+            if let Some(r) = report {
+                let terminal = r["terminal_state"].as_str().unwrap_or("");
+                if !terminal.is_empty() {
+                    push(
+                        SignalKind::TerminalState(terminal.into()),
+                        Provenance::Runtime,
+                        "report.terminal_state",
+                        format!("stack-agent ended the work as {terminal}"),
+                    );
+                }
+                let reason = r["outcome_reason"].as_str().unwrap_or("").to_string();
+                // stack-agent's loop guard (chip-core `stuck::REASON_PREFIX`) blocks a
+                // work that repeats itself; that reason is the runtime's, not the model's.
+                let stuck = reason.strip_prefix(STACK_AGENT_STUCK_PREFIX);
+                if let Some(rest) = stuck {
+                    let capability = rest.split_whitespace().next().unwrap_or("").to_string();
+                    push(
+                        SignalKind::RepeatedAction(capability),
+                        Provenance::Runtime,
+                        "report.outcome_reason",
+                        reason.clone(),
+                    );
+                }
+                match terminal {
+                    "escalated" | "blocked" => push(
+                        SignalKind::GaveUp,
+                        if stuck.is_some() {
+                            Provenance::Runtime
+                        } else {
+                            Provenance::AgentClaim
+                        },
+                        "report.outcome_reason",
+                        reason.clone(),
+                    ),
+                    "completed" => push(
+                        SignalKind::CompletionClaimed,
+                        Provenance::AgentClaim,
+                        "report.terminal_state",
+                        format!(
+                            "stack-agent reported the work completed (verified: {})",
+                            r["verified"]
+                        ),
+                    ),
+                    "limit_reached" => push(
+                        SignalKind::LimitReached(reason.clone()),
+                        Provenance::Runtime,
+                        "report.terminal_state",
+                        reason.clone(),
+                    ),
+                    _ => {}
+                }
+                for f in r["model_failures"].as_array().into_iter().flatten() {
+                    let kind = f["kind"].as_str().unwrap_or("unknown").to_string();
+                    push(
+                        SignalKind::ModelCallFailed(kind.clone()),
+                        Provenance::Observed,
+                        "report.model_failures",
+                        format!("model call failed: {kind} (status {})", f["status"]),
+                    );
+                }
+                let invalid = r["invalid_decisions"].as_u64().unwrap_or(0)
+                    + r["malformed_replies"]
+                        .as_array()
+                        .map_or(0, |a| a.len() as u64)
+                    + r["malformed_replies"].as_u64().unwrap_or(0);
+                if invalid > 0 {
+                    push(
+                        SignalKind::InvalidDecision,
+                        Provenance::Observed,
+                        "report.invalid_decisions",
+                        format!("{invalid} model replies were not valid decisions"),
+                    );
+                }
+                let audit = &r["audit"];
+                let violations: u64 = [
+                    "unauthorized_executions",
+                    "unauthorized_completions",
+                    "path_escape",
+                    "out_of_root_write",
+                ]
+                .iter()
+                .map(|k| audit[*k].as_u64().unwrap_or(0))
+                .sum();
+                let replaced = r["evidence"]["test_files_replaced"]
+                    .as_array()
+                    .map_or(0, |a| a.len());
+                if violations > 0 || replaced > 0 || !r["evidence"]["invalidated"].is_null() {
+                    push(
+                        SignalKind::AuthorityRejection,
+                        Provenance::Observed,
+                        "report.audit/evidence",
+                        format!(
+                            "{violations} audit violations, {replaced} replaced test files, evidence invalidated: {}",
+                            r["evidence"]["invalidated"]
+                        ),
+                    );
+                }
+                if audit["context_limit_rejections"].as_u64().unwrap_or(0) > 0 {
+                    push(
+                        SignalKind::ContextLimit,
+                        Provenance::Observed,
+                        "report.audit.context_limit_rejections",
+                        "a model request was over the context limit".into(),
+                    );
+                }
+                let executions: u64 = r["executions_by_capability"]
+                    .as_object()
+                    .map_or(0, |m| m.values().filter_map(Value::as_u64).sum());
+                if r["executions_by_capability"].is_object() && executions == 0 {
+                    push(
+                        SignalKind::NoActionTaken,
+                        Provenance::Observed,
+                        "report.executions_by_capability",
+                        "stack-agent executed no capability".into(),
+                    );
+                }
+                let discovery: u64 = ["lists", "searches", "reads"]
+                    .iter()
+                    .map(|k| r[*k].as_u64().unwrap_or(0))
+                    .sum();
+                if matches!(terminal, "escalated" | "blocked") && discovery == 0 {
+                    push(
+                        SignalKind::NoDiscovery,
+                        Provenance::Observed,
+                        "report.lists/searches/reads",
+                        "it stopped without listing, searching or reading any project file".into(),
+                    );
+                }
+            }
+            for e in trace.map(|t| t.events.as_slice()).unwrap_or(&[]) {
+                let source = format!("trace#{}", e.index);
+                match e.kind.as_str() {
+                    "ExecutionFailed" => {
+                        let code = failure_code(&e.data)
+                            .unwrap_or_else(|| e.data["reason"].as_str().unwrap_or("").to_string());
+                        if STACK_AGENT_AUTHORITY_PHRASES
+                            .iter()
+                            .any(|p| code.contains(p))
+                        {
+                            push(
+                                SignalKind::AuthorityRejection,
+                                Provenance::Observed,
+                                &source,
+                                code,
+                            );
+                        } else {
+                            push(
+                                SignalKind::CapabilityFailed(code.clone()),
+                                Provenance::Observed,
+                                &source,
+                                code,
+                            );
+                        }
+                    }
+                    "DecisionRejected" => {
+                        let reason = e.data["reason"].as_str().unwrap_or("").to_string();
+                        let kind = if STACK_AGENT_AUTHORITY_PHRASES
+                            .iter()
+                            .any(|p| reason.contains(p))
+                        {
+                            SignalKind::AuthorityRejection
+                        } else {
+                            SignalKind::InvalidDecision
+                        };
+                        push(kind, Provenance::Runtime, &source, reason);
+                    }
+                    "ContextLimit" => push(
+                        SignalKind::ContextLimit,
+                        Provenance::Runtime,
+                        &source,
+                        e.summary.clone(),
+                    ),
+                    "WorkLimitReached" => push(
+                        SignalKind::LimitReached(e.data["limit"].as_str().unwrap_or("").into()),
+                        Provenance::Runtime,
+                        &source,
+                        e.summary.clone(),
+                    ),
+                    "ModelCalled" if e.data["succeeded"] == false => push(
+                        SignalKind::ModelCallFailed("call_failed".into()),
+                        Provenance::Observed,
+                        &source,
+                        e.summary.clone(),
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        "claude-code" => {
+            if let Some(r) = report {
+                if r["is_error"] == true {
+                    push(
+                        SignalKind::TerminalState(r["subtype"].as_str().unwrap_or("error").into()),
+                        Provenance::Runtime,
+                        "report.is_error",
+                        format!("Claude Code ended with an error ({})", r["subtype"]),
+                    );
+                } else if r["subtype"] == "success" {
+                    push(
+                        SignalKind::CompletionClaimed,
+                        Provenance::AgentClaim,
+                        "report.result",
+                        "Claude Code reported a successful result".into(),
+                    );
+                }
+                if r["subtype"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("max_turns"))
+                {
+                    push(
+                        SignalKind::LimitReached("max_turns".into()),
+                        Provenance::Runtime,
+                        "report.subtype",
+                        "Claude Code stopped at its turn limit".into(),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    out
 }
