@@ -59,6 +59,7 @@ pub fn new_record(store: &Store, task: &BenchTask, agent_id: &str, app_version: 
                 .to_string(),
             executable: None,
             version: None,
+            runtime: None,
         },
         model: None,
         provider: None,

@@ -116,7 +116,10 @@
     "workdir": "Working directory",
     "fixtureCopy": "Copy of {{fixture}}:",
     "reveal": "Show in file manager",
-    "timeline": "Timeline"
+    "timeline": "Timeline",
+    "revision": "Stack-Agent revision",
+    "executableDigest": "Executable digest",
+    "latestMainAtRun": "main when the run started"
   },
   "compare": {
     "title": "Comparison",
@@ -148,7 +151,15 @@
       "provider": "Provider",
       "config": "Agent configuration",
       "app_version": "Atomic Chat version",
-      "in_progress": "Still running"
+      "in_progress": "Still running",
+      "agent_revision": "Stack-Agent revision"
+    },
+    "revision": "Stack-Agent revision",
+    "cause": {
+      "agent_runtime": "Agent runtime (version or Stack-Agent revision)",
+      "model": "Model or inference configuration",
+      "task": "Task, evaluation or fixture",
+      "execution": "Other execution settings"
     }
   },
   "editor": {
@@ -187,5 +198,54 @@
     "button": "Export runs",
     "done": "Runs exported as JSONL",
     "failed": "Could not export the runs"
+  },
+  "runtime": {
+    "title": "Stack-Agent runtime",
+    "description": "Atomic Chat builds stack-agent from the latest main into its own cache, validates it, and records the exact revision on every run. Other agents are not affected.",
+    "loading": "Reading the runtime status…",
+    "status": {
+      "not_installed": "Not prepared",
+      "current": "Current",
+      "update_available": "Update available",
+      "refreshing": "Refreshing",
+      "update_failed": "Update failed",
+      "stale": "May be stale",
+      "pinned": "Pinned",
+      "external": "Unmanaged"
+    },
+    "noRevision": "no managed revision",
+    "refresh": "Refresh",
+    "prepare": "Prepare",
+    "rollback": "Roll back",
+    "noRollback": "No previous validated revision is cached",
+    "rolledBack": "Rolled back to the previous revision",
+    "source": "Source",
+    "sourceKind": {
+      "managed": "built by Atomic Chat",
+      "custom_path": "custom path (Launch page)",
+      "external": "unmanaged, found on PATH"
+    },
+    "selectionKind": {
+      "follow_main": "following main",
+      "pinned": "pinned",
+      "custom_path": "custom path",
+      "external": "unmanaged"
+    },
+    "latestMain": "Latest main",
+    "neverChecked": "not checked yet",
+    "lastRefresh": "Last successful refresh",
+    "never": "never",
+    "revision": "Revision for runs",
+    "followMain": "Follow main (latest validated)",
+    "pinTo": "Pin {{commit}} (stack-agent {{version}})",
+    "log": "Refresh output ({{count}} lines)",
+    "reproduce": "Use this revision",
+    "pinned": "Runs now use revision {{commit}}",
+    "preparing": "Preparing revision {{commit}} in the background; pin it from the runtime panel when it is ready.",
+    "unmanagedRevision": "unknown ({{source}})",
+    "notRecorded": "not recorded (run predates runtime management)",
+    "matched": "(the same revision)",
+    "differed": "(a different revision)",
+    "matchUnknown": "(unknown)"
   }
 }

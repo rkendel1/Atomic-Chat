@@ -1065,3 +1065,202 @@ echo "turn 1: asking the model with $CHIP_API_KEY" >&2
         assert_eq!(run.failure_kind, Some(FailureKind::Verification));
     }
 }
+
+// ---- stack-agent runtime provenance -------------------------------------------
+
+#[cfg(unix)]
+mod runtime_provenance {
+    use super::*;
+    use crate::core::stack_agent_runtime::{
+        Manager, PrepareError, Prepared, Selection, Source, Trigger, BIN_NAME, REQUIRED_WORK_FLAGS,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    const A: &str = "1111111111111111111111111111111111111111";
+    const B: &str = "2222222222222222222222222222222222222222";
+
+    /// "Builds" a stack-agent whose `work` writes the commit it was built
+    /// from into the project, so a test can see which runtime really ran.
+    struct RevisionSource {
+        latest: Mutex<String>,
+    }
+
+    impl Source for RevisionSource {
+        fn repository(&self) -> &str {
+            "https://example.invalid/stack-agent"
+        }
+        fn latest(&self) -> Result<String, String> {
+            Ok(self.latest.lock().unwrap().clone())
+        }
+        fn history(&self, _: &str, _: usize, _: &Path) -> Result<Vec<String>, String> {
+            Ok(vec![])
+        }
+        fn prepare(
+            &self,
+            commit: &str,
+            staging: &Path,
+            _log: &mut dyn FnMut(&str),
+        ) -> Result<Prepared, PrepareError> {
+            let bin = staging.join("bin").join(BIN_NAME);
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            let script = format!(
+                r#"#!/bin/sh
+case "$1" in
+  --version) echo "stack-agent 0.1.0"; exit 0;;
+  --test) echo "Turn completed"; exit 0;;
+esac
+if [ "$2" = "--help" ]; then echo "{flags}"; exit 0; fi
+echo {commit} > revision.txt
+echo '{{"command":"work","terminal_state":"completed","verified":true}}'
+"#,
+                flags = REQUIRED_WORK_FLAGS.join(" ")
+            );
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Ok(Prepared {
+                binary: bin,
+                toolchain: None,
+            })
+        }
+    }
+
+    async fn run_with(
+        manager: &Arc<Manager>,
+        store: &Store,
+        task: &BenchTask,
+        listener: &std::net::TcpListener,
+    ) -> RunRecord {
+        let config = RunConfig {
+            agent_id: "stack-agent".into(),
+            model: Some("m".into()),
+            api_url: Some(format!("http://{}/v1", listener.local_addr().unwrap())),
+            api_key: None,
+            executable: None,
+        };
+        let (resolved, lease) = manager.resolve_for_run(None, &|| None).unwrap();
+        let launch = adapters::plan(task, &config, &resolved.path);
+        let mut run = executor::new_record(store, task, "stack-agent", "9.9.9");
+        run.agent.runtime = Some(resolved.provenance);
+        let ctx = Context {
+            store: store.clone(),
+            notify: Arc::new(|_| {}),
+            cancel: CancellationToken::new(),
+            slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            launch,
+            path_env: std::env::var("PATH").unwrap_or_default(),
+        };
+        let done = executor::execute(ctx, run).await;
+        drop(lease);
+        done
+    }
+
+    #[tokio::test]
+    async fn every_run_records_its_exact_runtime_and_a_pinned_revision_reproduces() {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let store = Store::new(data.path());
+        let source = Arc::new(RevisionSource {
+            latest: Mutex::new(A.into()),
+        });
+        let manager = Arc::new(Manager::new(data.path().join("runtime"), source.clone()));
+        let task = path_task(
+            project.path(),
+            vec![check("ran", "test", &["-f", "revision.txt"])],
+        );
+
+        manager.refresh(Trigger::Manual, &mut |_| {});
+        let first = run_with(&manager, &store, &task, &listener).await;
+        assert_eq!(first.status, RunStatus::Succeeded, "{:?}", first.errors);
+        let ran = std::fs::read_to_string(project.path().join("revision.txt")).unwrap();
+        assert_eq!(ran.trim(), A, "the recorded runtime is the one that ran");
+        let rt = first.agent.runtime.clone().unwrap();
+        assert_eq!(rt.commit.as_deref(), Some(A));
+        assert_eq!(rt.source, "managed");
+        assert_eq!(rt.selection, "follow_main");
+        assert_eq!(first.agent.executable.as_deref(), Some(rt.path.as_str()));
+        assert_eq!(first.agent.version.as_deref(), Some("stack-agent 0.1.0"));
+
+        // main advances: new runs use B, the earlier record still says A.
+        *source.latest.lock().unwrap() = B.into();
+        manager.refresh(Trigger::Automatic, &mut |_| {});
+        let second = run_with(&manager, &store, &task, &listener).await;
+        assert_eq!(
+            second.agent.runtime.as_ref().unwrap().commit.as_deref(),
+            Some(B)
+        );
+        assert_eq!(
+            store
+                .get_run(&first.id)
+                .unwrap()
+                .agent
+                .runtime
+                .unwrap()
+                .commit
+                .as_deref(),
+            Some(A)
+        );
+
+        // Reproduce the first run against its recorded revision.
+        manager
+            .select(Selection::Pinned { commit: A.into() })
+            .unwrap();
+        let again = run_with(&manager, &store, &task, &listener).await;
+        let ran = std::fs::read_to_string(project.path().join("revision.txt")).unwrap();
+        assert_eq!(ran.trim(), A);
+        let rt = again.agent.runtime.unwrap();
+        assert_eq!(rt.selection, "pinned");
+        assert_eq!(rt.matches_latest, Some(false));
+
+        // The export carries the revision; agents without one are not "unknown".
+        let line: serde_json::Value =
+            serde_json::from_str(export::export_jsonl(std::slice::from_ref(&first)).trim())
+                .unwrap();
+        assert_eq!(line["observed"]["agent_revision"], A);
+        assert_eq!(line["observed"]["agent_runtime"]["source"], "managed");
+        assert!(line["observed"]["agent_runtime"]["binary_sha256"].is_string());
+        assert!(!line["unknown"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("observed.agent_revision")));
+    }
+
+    #[test]
+    fn a_stack_agent_run_without_a_known_runtime_lists_it_as_unknown_and_other_agents_do_not() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::new(data.path());
+        let task = path_task(data.path(), vec![check("ok", "true", &[])]);
+        let finished = |agent: &str| {
+            let mut r = executor::new_record(&store, &task, agent, "9.9.9");
+            r.transition(RunStatus::Running).unwrap();
+            r.transition(RunStatus::Inconclusive).unwrap();
+            r
+        };
+        let unknown = |r: &RunRecord| export::export_line(r)["unknown"].clone();
+        assert!(unknown(&finished("stack-agent"))
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("observed.agent_revision")));
+        let claude = finished("claude-code");
+        assert!(!unknown(&claude)
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("observed.agent_revision")));
+        // Records of other agents serialize exactly as before.
+        assert!(!serde_json::to_string(&claude)
+            .unwrap()
+            .contains("\"runtime\""));
+    }
+
+    #[test]
+    fn a_record_written_before_runtime_provenance_still_loads() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::new(data.path());
+        let task = path_task(data.path(), vec![check("ok", "true", &[])]);
+        let run = executor::new_record(&store, &task, "stack-agent", "9.9.9");
+        let mut v = serde_json::to_value(&run).unwrap();
+        v["agent"].as_object_mut().unwrap().remove("runtime");
+        let back: RunRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(back.agent.runtime, None);
+    }
+}

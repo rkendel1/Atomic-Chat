@@ -26,6 +26,10 @@ const ABSENT_WHEN_NOT_APPLICABLE: &[&str] = &[
     "fixture",
 ];
 
+/// Fields only stack-agent runs have: null for other agents is "not
+/// applicable", not unknown.
+const RUNTIME_FIELDS: &[&str] = &["agent_revision", "agent_runtime"];
+
 pub fn export_line(run: &RunRecord) -> Value {
     let exec = run.execution.as_ref();
     let mut observed = Map::new();
@@ -34,6 +38,13 @@ pub fn export_line(run: &RunRecord) -> Value {
     };
     put("agent_id", json!(run.agent.id));
     put("agent_version", json!(run.agent.version));
+    // The exact stack-agent runtime (commit, source, executable digest) the
+    // runtime manager handed this run; not applicable to other agents.
+    put(
+        "agent_revision",
+        json!(run.agent.runtime.as_ref().and_then(|r| r.commit.clone())),
+    );
+    put("agent_runtime", json!(run.agent.runtime));
     put("execution_method", json!(run.agent.execution_method));
     put("model", json!(run.model));
     put("provider", json!(run.provider));
@@ -67,7 +78,11 @@ pub fn export_line(run: &RunRecord) -> Value {
 
     let unknown: Vec<String> = observed
         .iter()
-        .filter(|(k, v)| v.is_null() && !ABSENT_WHEN_NOT_APPLICABLE.contains(&k.as_str()))
+        .filter(|(k, v)| {
+            v.is_null()
+                && !ABSENT_WHEN_NOT_APPLICABLE.contains(&k.as_str())
+                && !(RUNTIME_FIELDS.contains(&k.as_str()) && run.agent.id != "stack-agent")
+        })
         .map(|(k, _)| format!("observed.{k}"))
         .chain(
             run.evaluation

@@ -38,6 +38,7 @@ import { TaskEditorDialog } from '@/containers/agent-bench/TaskEditorDialog'
 import { RunHistory } from '@/containers/agent-bench/RunHistory'
 import { RunDetail } from '@/containers/agent-bench/RunDetail'
 import { CompareTable } from '@/containers/agent-bench/CompareTable'
+import { RuntimePanel } from '@/containers/agent-bench/RuntimePanel'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const Route = createFileRoute(route.bench.index as any)({
@@ -246,7 +247,12 @@ export function AgentBenchPage() {
           model: model.trim() || null,
           api_url: apiUrl,
           api_key: useLocal ? apiKey || null : null,
-          executable: customPaths[adapter.id] || binPath[adapter.id] || null,
+          // stack-agent's executable comes from the runtime manager; only a
+          // path the user set on the Launch page overrides it.
+          executable:
+            customPaths[adapter.id] ||
+            (adapter.id === 'stack-agent' ? null : binPath[adapter.id]) ||
+            null,
         })
         first ??= record
       }
@@ -438,6 +444,17 @@ export function AgentBenchPage() {
               )}
             </Card>
           </Section>
+
+          {adapters.some((a) => a.id === 'stack-agent') && (
+            <Section
+              title={t('bench:runtime.title')}
+              description={t('bench:runtime.description')}
+            >
+              <Card className="rounded-lg bg-card">
+                <RuntimePanel />
+              </Card>
+            </Section>
+          )}
 
           <Section
             title={t('bench:run.title')}

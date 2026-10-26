@@ -9,6 +9,7 @@ use super::store::Store;
 use super::task::BenchTask;
 use super::{BenchState, RUN_UPDATED_EVENT};
 use crate::core::app::commands::get_jan_data_folder_path;
+use crate::core::stack_agent_runtime;
 
 /// The ledger, after recovering any run an earlier process left in progress.
 fn store<R: Runtime>(app: &AppHandle<R>, state: &BenchState) -> Store {
@@ -117,21 +118,36 @@ pub async fn bench_start_run<R: Runtime>(
     let adapter = adapters::adapter(&config.agent_id)
         .ok_or_else(|| format!("{} has no Agent Bench adapter", config.agent_id))?;
     let app_version = app.package_info().version.to_string();
-    let record = executor::new_record(&store, &task, adapter.id, &app_version);
+    let mut record = executor::new_record(&store, &task, adapter.id, &app_version);
 
     // Resolution can block on a login shell the first time; keep it off the
     // async runtime. Its failure is recorded on the run, not returned.
+    // stack-agent's executable comes from the runtime manager, once, here: the
+    // run keeps that exact runtime (and a lease on it) until it ends.
     let bin = adapter.bin;
     let given = config.executable.clone();
     let task_for_plan = task.clone();
     let config_for_plan = config.clone();
-    let (launch, path_env) = tokio::task::spawn_blocking(move || {
-        let launch = adapters::resolve_executable(bin, given.as_deref())
-            .and_then(|exe| adapters::plan(&task_for_plan, &config_for_plan, &exe));
-        (launch, adapters::child_path())
+    let runtime_app = app.clone();
+    let (launch, path_env, runtime) = tokio::task::spawn_blocking(move || {
+        let (exe, runtime) = if bin == "stack-agent" {
+            match stack_agent_runtime::commands::manager(&runtime_app).resolve_for_run(
+                given.as_deref(),
+                &stack_agent_runtime::commands::find_external,
+            ) {
+                Ok((r, lease)) => (Ok(r.path), Some((r.provenance, lease))),
+                Err(e) => (Err(e), None),
+            }
+        } else {
+            (adapters::resolve_executable(bin, given.as_deref()), None)
+        };
+        let launch = exe.and_then(|exe| adapters::plan(&task_for_plan, &config_for_plan, &exe));
+        (launch, adapters::child_path(), runtime)
     })
     .await
     .map_err(|e| e.to_string())?;
+    let (provenance, lease) = runtime.unzip();
+    record.agent.runtime = provenance;
 
     let cancel = tokio_util::sync::CancellationToken::new();
     state
@@ -155,6 +171,7 @@ pub async fn bench_start_run<R: Runtime>(
     let returned = record.clone();
     let app_for_task = app.clone();
     tauri::async_runtime::spawn(async move {
+        let _lease = lease;
         let id = record.id.clone();
         executor::execute(ctx, record).await;
         if let Some(state) = app_for_task.try_state::<BenchState>() {
