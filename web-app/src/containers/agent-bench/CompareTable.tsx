@@ -1,7 +1,11 @@
 import type { ReactNode } from 'react'
 import { useTranslation } from '@/i18n/react-i18next-compat'
 import { formatDuration } from '@/lib/agent-bench/args'
-import { compareRuns, type Metric } from '@/lib/agent-bench/compare'
+import {
+  CAUSE_ORDER,
+  compareRuns,
+  type Metric,
+} from '@/lib/agent-bench/compare'
 import type { RunRecord } from '@/lib/agent-bench/types'
 import { cn } from '@/lib/utils'
 
@@ -108,6 +112,15 @@ export function CompareTable({ runs }: { runs: RunRecord[] }) {
       )),
     },
     {
+      label: t('bench:compare.revision'),
+      cells: cmp.rows.map((r) => (
+        <Cell
+          metric={r.agentRevision}
+          render={(v) => <span className="font-mono">{v.slice(0, 12)}</span>}
+        />
+      )),
+    },
+    {
       label: t('bench:compare.model'),
       cells: cmp.rows.map((r) => (
         <span>
@@ -131,13 +144,23 @@ export function CompareTable({ runs }: { runs: RunRecord[] }) {
       {cmp.issues.length > 0 && (
         <div className="rounded-md bg-amber-500/10 px-2 py-1 text-xs text-amber-700 dark:text-amber-400">
           <p className="font-medium">{t('bench:compare.notComparable')}</p>
-          <ul className="list-disc pl-4">
-            {cmp.issues.map((i) => (
-              <li key={i.field}>
-                {t(`bench:compare.field.${i.field}`)}: {i.values.join(' / ')}
-              </li>
-            ))}
-          </ul>
+          {CAUSE_ORDER.filter((c) => cmp.issues.some((i) => i.cause === c)).map(
+            (cause) => (
+              <div key={cause} data-testid={`compare-cause-${cause}`}>
+                <p className="mt-1">{t(`bench:compare.cause.${cause}`)}</p>
+                <ul className="list-disc pl-4">
+                  {cmp.issues
+                    .filter((i) => i.cause === cause)
+                    .map((i) => (
+                      <li key={i.field} className="break-words">
+                        {t(`bench:compare.field.${i.field}`)}:{' '}
+                        {i.values.join(' / ')}
+                      </li>
+                    ))}
+                </ul>
+              </div>
+            )
+          )}
         </div>
       )}
       <div className="overflow-x-auto">

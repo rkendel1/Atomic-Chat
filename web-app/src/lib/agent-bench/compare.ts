@@ -27,6 +27,8 @@ export type ComparisonRow = {
     incomplete: boolean
   }>
   agentVersion: Metric<string>
+  /** The stack-agent commit that ran, when the runtime manager recorded it. */
+  agentRevision: Metric<string>
   model: Metric<string>
   provider: Metric<string>
   /** Fields in which this run differs from the first one compared. */
@@ -39,14 +41,44 @@ export type ComparabilityField =
   | 'evaluation'
   | 'workdir'
   | 'agent_version'
+  | 'agent_revision'
   | 'model'
   | 'provider'
   | 'config'
   | 'app_version'
   | 'in_progress'
 
+/**
+ * What a difference can explain, so a changed result is attributed to the
+ * right cause: the agent's own runtime, the model or inference settings, the
+ * task or its fixture, or anything else about how the run was executed.
+ */
+export type DifferenceCause = 'agent_runtime' | 'model' | 'task' | 'execution'
+
+export const CAUSE_OF: Record<ComparabilityField, DifferenceCause> = {
+  agent_version: 'agent_runtime',
+  agent_revision: 'agent_runtime',
+  model: 'model',
+  provider: 'model',
+  config: 'model',
+  task: 'task',
+  task_version: 'task',
+  evaluation: 'task',
+  workdir: 'task',
+  app_version: 'execution',
+  in_progress: 'execution',
+}
+
+export const CAUSE_ORDER: DifferenceCause[] = [
+  'agent_runtime',
+  'model',
+  'task',
+  'execution',
+]
+
 export type ComparabilityIssue = {
   field: ComparabilityField
+  cause: DifferenceCause
   /** Distinct values seen, `unknown` where a run did not record one. */
   values: string[]
 }
@@ -121,6 +153,10 @@ const configKey = (run: RunRecord) =>
       .map((k) => [k, run.config[k]])
   )
 
+/** The commit, or `unknown`; only stack-agent runs record one. */
+const revisionOf = (run: RunRecord): string =>
+  run.agent.runtime?.commit ?? 'unknown'
+
 const evaluationKey = (run: RunRecord) =>
   JSON.stringify(run.task.snapshot?.evaluation ?? null)
 
@@ -151,6 +187,13 @@ function differencesFrom(ref: RunRecord, run: RunRecord): ComparabilityField[] {
   if (run.agent.id === ref.agent.id) {
     if ((run.agent.version ?? '') !== (ref.agent.version ?? ''))
       out.push('agent_version')
+    // An unknown revision is never assumed to match a known one.
+    if (
+      run !== ref &&
+      run.agent.id === 'stack-agent' &&
+      (revisionOf(run) !== revisionOf(ref) || revisionOf(run) === 'unknown')
+    )
+      out.push('agent_revision')
     if (configKey(run) !== configKey(ref)) out.push('config')
   }
   if (run.app_version !== ref.app_version) out.push('app_version')
@@ -171,6 +214,8 @@ function issueValues(runs: RunRecord[], field: ComparabilityField): string[] {
         return workdirKey(r)
       case 'agent_version':
         return `${r.agent.name}: ${r.agent.version ?? 'unknown'}`
+      case 'agent_revision':
+        return `${r.agent.name}: ${revisionOf(r).slice(0, 12)}`
       case 'model':
         return r.model ?? 'unknown'
       case 'provider':
@@ -205,15 +250,29 @@ export function compareRuns(runs: RunRecord[]): Comparison {
     process: processOf(run),
     changes: changesOf(run),
     agentVersion: str(run.agent.version, 'version not reported'),
+    agentRevision:
+      run.agent.id !== 'stack-agent'
+        ? missing('not a stack-agent run')
+        : str(
+            run.agent.runtime?.commit,
+            run.agent.runtime
+              ? 'unmanaged executable: revision unknown'
+              : 'runtime not recorded'
+          ),
     model: str(run.model, 'model not recorded'),
     provider: str(run.provider, 'provider not recorded'),
     differences: differencesFrom(ref, run),
   }))
   const fields = [...new Set(rows.flatMap((r) => r.differences))]
-  const issues = fields.map((field) => ({
-    field,
-    values: issueValues(runs, field),
-  }))
+  const issues = fields
+    .map((field) => ({
+      field,
+      cause: CAUSE_OF[field],
+      values: issueValues(runs, field),
+    }))
+    .sort(
+      (a, b) => CAUSE_ORDER.indexOf(a.cause) - CAUSE_ORDER.indexOf(b.cause)
+    )
   return {
     rows,
     issues,

@@ -211,6 +211,11 @@ pub fn run() {
         core::agent_bench::commands::bench_list_suite_runs,
         core::agent_bench::commands::bench_compare_suite_runs,
         core::agent_bench::commands::bench_failure_summary,
+        core::stack_agent_runtime::commands::stack_agent_runtime_status,
+        core::stack_agent_runtime::commands::stack_agent_runtime_refresh,
+        core::stack_agent_runtime::commands::stack_agent_runtime_prepare_revision,
+        core::stack_agent_runtime::commands::stack_agent_runtime_select,
+        core::stack_agent_runtime::commands::stack_agent_runtime_rollback,
         core::system::agent_config_detection::detect_configured_agents,
         core::system::commands::open_agent_terminal,
         core::system::commands::launch_editor,
@@ -507,6 +512,7 @@ pub fn run() {
         .manage(core::filesystem::model_roots::CoreModelRoot::default())
         .manage(core::chat_exec::ChatExecState::default())
         .manage(core::agent_bench::BenchState::default())
+        .manage(core::stack_agent_runtime::commands::RuntimeState::default())
         .manage(AppState {
             app_token: Some(generate_app_token()),
             mcp_servers: Arc::new(Mutex::new(HashMap::new())),
@@ -734,6 +740,10 @@ pub fn run() {
             }
 
             setup_mcp(app);
+            // Only once someone has prepared a stack-agent runtime; see
+            // core::stack_agent_runtime.
+            #[cfg(desktop)]
+            core::stack_agent_runtime::commands::spawn_background_refresh(app.handle().clone());
             // Not in an end-to-end build: a clean profile always counts as a
             // version change, so every run would overwrite the CLI on the
             // operator's real PATH — outside the isolated test root.

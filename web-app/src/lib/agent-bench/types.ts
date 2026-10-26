@@ -122,6 +122,8 @@ export type RunRecord = {
     execution_method: string
     executable: string | null
     version: string | null
+    /** stack-agent only: the runtime the runtime manager handed this run. */
+    runtime?: RuntimeProvenance | null
   }
   model: string | null
   provider: string | null
@@ -494,3 +496,86 @@ export type RegressionRequest = {
   proposed_improvement: string | null
   expected_outcome: 'success' | 'failure' | null
 }
+
+/** How a stack-agent run's executable was chosen, and what it is. */
+export type RuntimeProvenance = {
+  source: 'managed' | 'custom_path' | 'external'
+  selection: 'follow_main' | 'pinned' | 'custom_path' | 'external'
+  path: string
+  commit: string | null
+  version: string | null
+  platform: string
+  binary_sha256: string | null
+  repository: string | null
+  toolchain: string | null
+  prepared_at: string | null
+  latest_known_main: string | null
+  latest_checked_at: string | null
+  matches_latest: boolean | null
+}
+
+export type RuntimeSelection =
+  | { mode: 'follow_main' }
+  | { mode: 'pinned'; commit: string }
+
+export type RuntimeStatusKind =
+  | 'not_installed'
+  | 'current'
+  | 'update_available'
+  | 'refreshing'
+  | 'update_failed'
+  | 'stale'
+  | 'pinned'
+  | 'external'
+
+export type RuntimeHealthCheck = { name: string; passed: boolean; detail: string }
+
+export type RuntimeManifest = {
+  schema: string
+  commit: string
+  platform: string
+  repository: string
+  source: string
+  version: string
+  binary: string
+  binary_sha256: string
+  toolchain: string | null
+  prepared_at: string
+  validated_at: string
+  checks: RuntimeHealthCheck[]
+}
+
+export type RuntimeStatus = {
+  status: RuntimeStatusKind
+  detail: string
+  enabled: boolean
+  platform: string
+  repository: string
+  tracked_ref: string
+  selection: RuntimeSelection
+  resolved: RuntimeProvenance | null
+  resolve_error?: string
+  active: string | null
+  previous: string[]
+  latest_remote: { commit: string; checked_at: string } | null
+  last_check: { at: string; ok: boolean; error: string | null } | null
+  last_success_refresh_at: string | null
+  refreshing: {
+    commit: string | null
+    stage: string
+    started_at: string
+    last_line?: string
+  } | null
+  failure: { commit: string; at: string; stage: string; error: string } | null
+  rolled_back: string[]
+  cached: {
+    commit: string
+    path: string
+    valid: boolean
+    problem?: string
+    manifest?: RuntimeManifest
+  }[]
+}
+
+export const shortCommit = (commit: string | null | undefined): string =>
+  commit ? commit.slice(0, 12) : 'unknown'

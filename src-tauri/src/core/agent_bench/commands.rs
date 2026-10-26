@@ -19,6 +19,7 @@ use super::task::BenchTask;
 use super::timeline;
 use super::{BenchState, RUN_UPDATED_EVENT};
 use crate::core::app::commands::get_jan_data_folder_path;
+use crate::core::stack_agent_runtime;
 
 /// The ledger, after recovering any run an earlier process left in progress.
 fn store<R: Runtime>(app: &AppHandle<R>, state: &BenchState) -> Store {
@@ -126,6 +127,77 @@ pub async fn bench_start_run<R: Runtime>(
     start(&app, &state, store, task, config, None).await
 }
 
+/// A run ready to be queued: its record (with the exact stack-agent runtime
+/// it will execute), its launch plan, and the lease that keeps that runtime
+/// on disk until the run ends.
+pub(crate) struct PreparedRun {
+    pub record: RunRecord,
+    pub launch: Result<adapters::Launch, String>,
+    pub lease: Option<stack_agent_runtime::Lease>,
+}
+
+/// The blocking half of starting a run. stack-agent's executable comes from
+/// the runtime manager, once, here; other agents resolve their own. A failure
+/// to resolve or plan is recorded on the run, not returned.
+pub(crate) fn prepare_run(
+    store: &Store,
+    task: &BenchTask,
+    config: &RunConfig,
+    app_version: &str,
+    suite: Option<SuiteRef>,
+    runtime: &std::sync::Arc<stack_agent_runtime::Manager>,
+    find_external: &dyn Fn() -> Option<std::path::PathBuf>,
+) -> Result<PreparedRun, String> {
+    task.validate()?;
+    let adapter = adapters::adapter(&config.agent_id)
+        .ok_or_else(|| format!("{} has no Agent Bench adapter", config.agent_id))?;
+    let mut record = executor::new_record(store, task, adapter.id, app_version);
+    record.suite = suite;
+    let evidence_dir = store.evidence_dir(&record.id);
+    std::fs::create_dir_all(&evidence_dir)
+        .map_err(|e| format!("could not create {}: {e}", evidence_dir.display()))?;
+    let given = config.executable.as_deref();
+    let (exe, lease) = if adapter.bin == "stack-agent" {
+        match runtime.resolve_for_run(given, find_external) {
+            Ok((r, lease)) => {
+                record.agent.runtime = Some(r.provenance);
+                (Ok(r.path), lease)
+            }
+            Err(e) => (Err(e), None),
+        }
+    } else {
+        (adapters::resolve_executable(adapter.bin, given), None)
+    };
+    let launch = exe.and_then(|exe| adapters::plan(task, config, &exe, Some(&evidence_dir)));
+    Ok(PreparedRun {
+        record,
+        launch,
+        lease,
+    })
+}
+
+/// For a suite run: the managed stack-agent executable every entry will use,
+/// so a refresh that lands mid-suite cannot split it across revisions. A path
+/// the user set, or an unmanaged executable, is left as it is.
+pub(crate) fn pin_suite_runtime(
+    mut config: RunConfig,
+    runtime: &stack_agent_runtime::Manager,
+    find_external: &dyn Fn() -> Option<std::path::PathBuf>,
+) -> RunConfig {
+    let unset = config
+        .executable
+        .as_deref()
+        .map_or(true, |p| p.trim().is_empty());
+    if config.agent_id == "stack-agent" && unset {
+        if let Ok(r) = runtime.resolve(None, find_external) {
+            if r.provenance.source == "managed" {
+                config.executable = Some(r.path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    config
+}
+
 /// Starts one run of `task` (any stored version) and returns its queued record.
 async fn start<R: Runtime>(
     app: &AppHandle<R>,
@@ -135,30 +207,30 @@ async fn start<R: Runtime>(
     config: RunConfig,
     suite: Option<SuiteRef>,
 ) -> Result<RunRecord, String> {
-    task.validate()?;
-    let adapter = adapters::adapter(&config.agent_id)
-        .ok_or_else(|| format!("{} has no Agent Bench adapter", config.agent_id))?;
     let app_version = app.package_info().version.to_string();
-    let mut record = executor::new_record(&store, &task, adapter.id, &app_version);
-    record.suite = suite;
-    let evidence_dir = store.evidence_dir(&record.id);
-    std::fs::create_dir_all(&evidence_dir)
-        .map_err(|e| format!("could not create {}: {e}", evidence_dir.display()))?;
-
+    let runtime = stack_agent_runtime::commands::manager(app);
     // Resolution can block on a login shell the first time; keep it off the
-    // async runtime. Its failure is recorded on the run, not returned.
-    let bin = adapter.bin;
-    let given = config.executable.clone();
-    let task_for_plan = task.clone();
-    let config_for_plan = config.clone();
-    let (launch, path_env) = tokio::task::spawn_blocking(move || {
-        let launch = adapters::resolve_executable(bin, given.as_deref()).and_then(|exe| {
-            adapters::plan(&task_for_plan, &config_for_plan, &exe, Some(&evidence_dir))
-        });
-        (launch, adapters::child_path())
+    // async runtime.
+    let store_for_prep = store.clone();
+    let (prepared, path_env) = tokio::task::spawn_blocking(move || {
+        let prepared = prepare_run(
+            &store_for_prep,
+            &task,
+            &config,
+            &app_version,
+            suite,
+            &runtime,
+            &stack_agent_runtime::commands::find_external,
+        );
+        (prepared, adapters::child_path())
     })
     .await
     .map_err(|e| e.to_string())?;
+    let PreparedRun {
+        record,
+        launch,
+        lease,
+    } = prepared?;
 
     let cancel = tokio_util::sync::CancellationToken::new();
     state
@@ -182,6 +254,7 @@ async fn start<R: Runtime>(
     let returned = record.clone();
     let app_for_task = app.clone();
     tauri::async_runtime::spawn(async move {
+        let _lease = lease;
         let id = record.id.clone();
         executor::execute(ctx, record).await;
         if let Some(state) = app_for_task.try_state::<BenchState>() {
@@ -408,6 +481,17 @@ pub async fn bench_run_suite<R: Runtime>(
     if suite.entries.is_empty() {
         return Err("the suite has no tasks".into());
     }
+    // Every entry of one suite run uses the same stack-agent build.
+    let runtime = stack_agent_runtime::commands::manager(&app);
+    let config = tokio::task::spawn_blocking(move || {
+        pin_suite_runtime(
+            config,
+            &runtime,
+            &stack_agent_runtime::commands::find_external,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     let mut suite_run = SuiteRun {
         schema: SUITE_RUN_SCHEMA.into(),
         id: super::store::new_suite_run_id(),

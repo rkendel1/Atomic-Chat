@@ -23,6 +23,8 @@ pub mod timeline;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_runtime;
+#[cfg(test)]
 mod tests_workshop;
 
 use std::collections::HashMap;

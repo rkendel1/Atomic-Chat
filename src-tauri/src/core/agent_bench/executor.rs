@@ -70,6 +70,7 @@ pub fn new_record(store: &Store, task: &BenchTask, agent_id: &str, app_version: 
                 .to_string(),
             executable: None,
             version: None,
+            runtime: None,
         },
         model: None,
         provider: None,
@@ -163,6 +164,31 @@ pub async fn execute(ctx: Context, mut run: RunRecord) -> RunRecord {
         Ok(l) => l,
         Err(e) => return fail_execution(&ctx, run, e, None),
     };
+    // The recorded runtime must be the file about to run: a managed
+    // stack-agent is checked against the digest it was resolved with.
+    if let Some(expected) = run
+        .agent
+        .runtime
+        .as_ref()
+        .and_then(|r| r.binary_sha256.clone())
+    {
+        let program = launch.program.clone();
+        let actual = tokio::task::spawn_blocking(move || {
+            crate::core::stack_agent_runtime::sha256_file(&program)
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+        match actual {
+            Ok(d) if d == expected => {}
+            Ok(d) => {
+                let e = format!(
+                    "the stack-agent executable changed after it was resolved (sha256 {d}, recorded {expected}); not running it"
+                );
+                return fail_execution(&ctx, run, e, None);
+            }
+            Err(e) => return fail_execution(&ctx, run, e, None),
+        }
+    }
     let redactor = Redactor::new(launch.secrets.clone());
     run.agent.executable = Some(launch.program.to_string_lossy().into_owned());
     run.model = launch.model.clone();

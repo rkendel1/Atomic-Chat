@@ -44,6 +44,7 @@ import { RunInspector } from '@/containers/agent-bench/RunInspector'
 import { CreateRegressionDialog } from '@/containers/agent-bench/CreateRegressionDialog'
 import { SuitesPanel } from '@/containers/agent-bench/SuitesPanel'
 import { FailuresPanel } from '@/containers/agent-bench/FailuresPanel'
+import { RuntimePanel } from '@/containers/agent-bench/RuntimePanel'
 import { CompareTable } from '@/containers/agent-bench/CompareTable'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -257,7 +258,12 @@ export function AgentBenchPage() {
           ? agentApiUrl(agent, { serverHost, serverPort, apiPrefix, apiKey })
           : null,
       api_key: useLocal ? apiKey || null : null,
-      executable: customPaths[agentId] || binPath[agentId] || null,
+      // stack-agent's executable comes from the runtime manager (single runs
+      // and suite runs alike); only a path set on the Launch page overrides it.
+      executable:
+        customPaths[agentId] ||
+        (agentId === 'stack-agent' ? null : binPath[agentId]) ||
+        null,
     }
   }
 
@@ -345,6 +351,17 @@ export function AgentBenchPage() {
             <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
               {loadError}
             </p>
+          )}
+
+          {overview?.adapters.some((a) => a.id === 'stack-agent') && (
+            <Section
+              title={t('bench:runtime.title')}
+              description={t('bench:runtime.description')}
+            >
+              <Card className="rounded-lg bg-card">
+                <RuntimePanel />
+              </Card>
+            </Section>
           )}
 
           <div role="tablist" className="flex gap-1 border-b">

@@ -1,4 +1,4 @@
-import { act, render, screen, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 import {
@@ -9,17 +9,29 @@ import {
   XL_FONT_SIZE,
   DEFAULT_FONT_SIZE,
 } from '@/test/layout'
-import { run } from '@/lib/agent-bench/__tests__/fixtures'
+import {
+  REVISION_A,
+  run,
+  runtimeStatus,
+} from '@/lib/agent-bench/__tests__/fixtures'
 import type { RunInspection, WorkshopRun } from '@/lib/agent-bench/types'
 
 import { RunInspector } from '../RunInspector'
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
+const runtimeStatusCall = vi.fn()
+const prepareRevision = vi.fn()
+const selectRevision = vi.fn()
 vi.mock('@/lib/agent-bench/api', () => ({
   benchApi: {
     cancelRun: vi.fn(),
     submitReview: vi.fn(),
     addAssessment: vi.fn(),
+  },
+  runtimeApi: {
+    status: () => runtimeStatusCall(),
+    prepareRevision: (c: string) => prepareRevision(c),
+    select: (s: unknown) => selectRevision(s),
   },
 }))
 
@@ -291,5 +303,59 @@ describe('RunInspector', () => {
     expect(screen.getByText(/does not print its model replies/)).toBeTruthy()
     // Without a trajectory the stop point comes from the process.
     expect(screen.getByText(/the agent recorded no trajectory/)).toBeTruthy()
+  })
+
+  it('shows the exact stack-agent revision a run used and reproduces it', async () => {
+    for (const size of [DEFAULT_FONT_SIZE, XL_FONT_SIZE]) {
+      setFontSize(size)
+      const view = await mount(inspection(realFailure, []))
+      expect(screen.getByText('Stack-Agent revision')).toBeTruthy()
+      expect(screen.getByTitle(REVISION_A).textContent).toBe(
+        REVISION_A.slice(0, 12)
+      )
+      expect(
+        screen.getByText(/built by Atomic Chat · following main/)
+      ).toBeTruthy()
+      expect(screen.getByText(/sha256:ffffffffffffffff/)).toBeTruthy()
+      expectNoHorizontalOverflow(
+        view.container.firstElementChild as HTMLElement
+      )
+      view.unmount()
+    }
+    // Not cached any more: prepare it (it is pinned once ready).
+    setFontSize(DEFAULT_FONT_SIZE)
+    runtimeStatusCall.mockResolvedValueOnce(runtimeStatus({ cached: [] }))
+    await mount(inspection(realFailure, []))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Use this revision' }))
+      await settle()
+    })
+    expect(prepareRevision).toHaveBeenCalledWith(REVISION_A)
+    expect(selectRevision).not.toHaveBeenCalled()
+  })
+
+  it('says when a run has no recorded runtime, and asks only stack-agent runs', async () => {
+    setFontSize(DEFAULT_FONT_SIZE)
+    const legacy: WorkshopRun = {
+      ...realFailure,
+      agent: { ...realFailure.agent, runtime: undefined },
+    }
+    const view = await mount(inspection(legacy, []))
+    expect(
+      screen.getByText('not recorded (run predates runtime management)')
+    ).toBeTruthy()
+    view.unmount()
+    const claude: WorkshopRun = {
+      ...realFailure,
+      agent: {
+        id: 'claude-code',
+        name: 'Claude Code',
+        execution_method: 'cli:claude -p --output-format json',
+        executable: '/bin/claude',
+        version: '2.0.0',
+      },
+    }
+    await mount(inspection(claude, []))
+    expect(screen.queryByText('Stack-Agent revision')).toBeNull()
   })
 })

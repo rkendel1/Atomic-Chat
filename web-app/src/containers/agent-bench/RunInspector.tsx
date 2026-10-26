@@ -5,17 +5,19 @@ import { invoke } from '@tauri-apps/api/core'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { useTranslation } from '@/i18n/react-i18next-compat'
-import { benchApi } from '@/lib/agent-bench/api'
+import { benchApi, runtimeApi } from '@/lib/agent-bench/api'
 import { formatDuration } from '@/lib/agent-bench/args'
 import { stopPointOf } from '@/lib/agent-bench/inspect'
 import {
   CATEGORIES,
   EVIDENCE_CLASSES,
   isTerminal,
+  shortCommit,
   type CapturedText,
   type Category,
   type Confidence,
   type RunInspection,
+  type RuntimeProvenance,
   type Verdict,
 } from '@/lib/agent-bench/types'
 import { cn } from '@/lib/utils'
@@ -38,6 +40,97 @@ function Unavailable({ reason }: { reason?: string | null }) {
       {t('bench:unavailable')}
       {reason ? ` — ${reason}` : ''}
     </span>
+  )
+}
+
+/**
+ * The exact stack-agent runtime a run used, and a way to prepare and pin it
+ * again to reproduce the run after Atomic Chat moved to a newer revision.
+ */
+function RuntimeRows({ runtime }: { runtime: RuntimeProvenance | null }) {
+  const { t } = useTranslation()
+  const [busy, setBusy] = useState(false)
+  const commit = runtime?.commit ?? null
+  const reproduce = async () => {
+    if (!commit) return
+    setBusy(true)
+    try {
+      const status = await runtimeApi.status()
+      if (status.cached.some((c) => c.commit === commit && c.valid)) {
+        await runtimeApi.select({ mode: 'pinned', commit })
+        toast.success(t('bench:runtime.pinned', { commit: shortCommit(commit) }))
+      } else {
+        await runtimeApi.prepareRevision(commit)
+        toast.info(
+          t('bench:runtime.preparing', { commit: shortCommit(commit) })
+        )
+      }
+    } catch (err) {
+      toast.error(String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <>
+      <Row label={t('bench:detail.revision')}>
+        {commit ? (
+          <span className="flex flex-wrap items-center gap-2">
+            <span className="font-mono" title={commit}>
+              {shortCommit(commit)}
+            </span>
+            <span className="text-muted-foreground">
+              {t(`bench:runtime.sourceKind.${runtime!.source}`)} ·{' '}
+              {t(`bench:runtime.selectionKind.${runtime!.selection}`)}
+            </span>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 px-2 text-xs"
+              disabled={busy}
+              onClick={reproduce}
+            >
+              {t('bench:runtime.reproduce')}
+            </Button>
+          </span>
+        ) : runtime ? (
+          <span className="text-muted-foreground">
+            {t('bench:runtime.unmanagedRevision', {
+              source: t(`bench:runtime.sourceKind.${runtime.source}`),
+            })}
+          </span>
+        ) : (
+          <span className="text-muted-foreground">
+            {t('bench:runtime.notRecorded')}
+          </span>
+        )}
+      </Row>
+      {runtime?.binary_sha256 && (
+        <Row label={t('bench:detail.executableDigest')}>
+          <span className="font-mono">
+            sha256:{runtime.binary_sha256.slice(0, 16)}…
+          </span>
+        </Row>
+      )}
+      {runtime && (
+        <Row label={t('bench:detail.latestMainAtRun')}>
+          {runtime.latest_known_main ? (
+            <span className="font-mono">
+              {shortCommit(runtime.latest_known_main)}{' '}
+              <span className="font-sans text-muted-foreground">
+                {runtime.matches_latest === true
+                  ? t('bench:runtime.matched')
+                  : runtime.matches_latest === false
+                    ? t('bench:runtime.differed')
+                    : t('bench:runtime.matchUnknown')}
+              </span>
+            </span>
+          ) : (
+            <Unavailable />
+          )}
+        </Row>
+      )}
+    </>
   )
 }
 
@@ -592,6 +685,9 @@ export function RunInspector({
         <Row label={t('bench:detail.agentVersion')}>
           {run.agent.version ?? <Unavailable />}
         </Row>
+        {run.agent.id === 'stack-agent' && (
+          <RuntimeRows runtime={run.agent.runtime ?? null} />
+        )}
         <Row label={t('bench:detail.model')}>
           {run.model ?? <Unavailable />}
         </Row>

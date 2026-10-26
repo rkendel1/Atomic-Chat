@@ -2128,41 +2128,6 @@ fn agent_install_spec(
             let prereq = if cfg!(windows) { "powershell" } else { "curl" };
             Ok((program, args, prereq, "https://docs.poolside.ai/cli"))
         }
-        "stack-agent" => {
-            // stack-agent ships a release installer that verifies the archive's
-            // SHA-256 and drops one file into ~/.local/bin (never sudo, never a
-            // profile edit; see `off_path_candidates`). It has prebuilt releases
-            // for macOS arm64 and Linux x86_64 only, so when that installer
-            // fails -- another platform, or no release published yet -- build
-            // it from source with cargo, which lands in ~/.cargo/bin. Windows
-            // has no release at all and always builds from source.
-            const GIT: &str = "https://github.com/rkendel1/stack-agent";
-            let (program, args): (String, Vec<String>) = if cfg!(windows) {
-                (
-                    "cmd".to_string(),
-                    vec![
-                        "/C".to_string(),
-                        format!("cargo install --locked --git {GIT} stack-agent"),
-                    ],
-                )
-            } else {
-                (
-                    "bash".to_string(),
-                    vec![
-                        "-c".to_string(),
-                        format!(
-                            "set -o pipefail; curl -fsSL {GIT}/releases/latest/download/install.sh | sh -s -- --force \
-                             || {{ echo 'No prebuilt stack-agent for this machine; building it from source with cargo.'; \
-                             CARGO=$(command -v cargo || echo \"$HOME/.cargo/bin/cargo\"); \
-                             [ -x \"$CARGO\" ] || {{ echo 'cargo not found: install Rust from https://rustup.rs and try again.' >&2; exit 1; }}; \
-                             \"$CARGO\" install --locked --git {GIT} stack-agent; }}"
-                        ),
-                    ],
-                )
-            };
-            let prereq = if cfg!(windows) { "cargo" } else { "curl" };
-            Ok((program, args, prereq, GIT))
-        }
         "zed" => {
             // Zed ships its own installer (NOT npm). On macOS/Linux the official
             // shell script downloads the editor and drops a `zed` CLI shim on
@@ -2674,8 +2639,49 @@ async fn detect_via_wsl(bin: &str) -> bool {
 /// 2. native PATH lookup (`which` / `where`).
 /// 3. (Windows only) a WSL fallback so agents installed inside a WSL
 ///    distribution are detected instead of showing as missing.
+///
+/// stack-agent is the exception: without a custom path its executable comes
+/// from the runtime manager ([`crate::core::stack_agent_runtime`]), which
+/// prefers the managed runtime and only then an unmanaged one on PATH.
 #[tauri::command]
-pub async fn detect_agent_installed(bin: String, custom_path: Option<String>) -> AgentDetection {
+pub async fn detect_agent_installed<R: Runtime>(
+    app: AppHandle<R>,
+    bin: String,
+    custom_path: Option<String>,
+) -> AgentDetection {
+    let no_custom = custom_path.as_deref().map_or(true, |p| p.trim().is_empty());
+    if bin == "stack-agent" && no_custom {
+        let resolved = tokio::task::spawn_blocking(move || {
+            use crate::core::stack_agent_runtime::commands::{find_external, manager};
+            let m = manager(&app);
+            let r = m.resolve(None, &find_external);
+            (r, m.enabled())
+        })
+        .await;
+        match resolved {
+            Ok((Ok(r), _)) => {
+                return AgentDetection {
+                    installed: true,
+                    via_wsl: false,
+                    path: Some(r.path.to_string_lossy().into_owned()),
+                }
+            }
+            // A managed runtime was set up (or a revision pinned) but cannot
+            // be used: say so instead of quietly using another executable.
+            Ok((Err(_), true)) => {
+                return AgentDetection {
+                    installed: false,
+                    via_wsl: false,
+                    path: None,
+                }
+            }
+            _ => {}
+        }
+    }
+    probe_agent_installed(bin, custom_path).await
+}
+
+async fn probe_agent_installed(bin: String, custom_path: Option<String>) -> AgentDetection {
     if let Some(path) = custom_path
         .as_deref()
         .map(str::trim)
@@ -2744,7 +2750,7 @@ async fn try_bootstrap_npm_via_winget<R: Runtime>(
 ) -> bool {
     // winget itself (App Installer) must be present; it ships on Win10 1809+
     // mainline but not on LTSC / Server / stripped images.
-    if !detect_agent_installed("winget".to_string(), None)
+    if !probe_agent_installed("winget".to_string(), None)
         .await
         .installed
     {
@@ -2817,7 +2823,7 @@ async fn try_bootstrap_npm_via_winget<R: Runtime>(
 
     // winget adds the Node install dir to PATH; `detect_agent_installed`
     // re-reads the registry PATH at runtime, so npm is found without a restart.
-    detect_agent_installed("npm".to_string(), None)
+    probe_agent_installed("npm".to_string(), None)
         .await
         .installed
 }
@@ -2831,6 +2837,40 @@ async fn try_bootstrap_npm_via_winget<R: Runtime>(
     false
 }
 
+/// stack-agent is not installed globally: the runtime manager prepares a
+/// managed runtime from the latest `main` (or reuses the cached one), and
+/// its output streams to the same `agent_install_log:stack-agent` event.
+async fn install_stack_agent_runtime<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    use crate::core::stack_agent_runtime::{commands, RefreshOutcome, Trigger};
+    let event = "agent_install_log:stack-agent".to_string();
+    let outcome = commands::refresh_now(app, Trigger::Manual, Some(event)).await?;
+    let usable = {
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || commands::resolve(&app, None).is_ok())
+            .await
+            .unwrap_or(false)
+    };
+    match outcome {
+        RefreshOutcome::Activated { .. }
+        | RefreshOutcome::ActivatedPrevious { .. }
+        | RefreshOutcome::ActivatedCached { .. }
+        | RefreshOutcome::AlreadyCurrent { .. }
+        | RefreshOutcome::Pinned { .. } => Ok(()),
+        RefreshOutcome::Busy => Err(
+            "stack-agent is already being prepared; it will be ready when that finishes.".into(),
+        ),
+        RefreshOutcome::CheckFailed { error } if !usable => Err(format!(
+            "Could not reach the stack-agent repository to prepare a runtime: {error}"
+        )),
+        RefreshOutcome::PrepareFailed { stage, error, .. } if !usable => {
+            Err(format!("Preparing stack-agent failed ({stage}): {error}"))
+        }
+        // An update failed but the last known-good runtime is still usable;
+        // Agent Bench's runtime panel shows the failure.
+        _ => Ok(()),
+    }
+}
+
 /// Install an external agent by spawning its official installer, streaming
 /// stdout/stderr to the UI via the `agent_install_log:<agent_id>` event.
 #[tauri::command]
@@ -2839,6 +2879,9 @@ pub async fn install_agent<R: Runtime>(
     agent_id: String,
     proxy: Option<ProxyEnv>,
 ) -> Result<(), String> {
+    if agent_id == "stack-agent" {
+        return install_stack_agent_runtime(&app_handle).await;
+    }
     let (program, mut args, prereq, docs) = agent_install_spec(&agent_id)?;
 
     let event = format!("agent_install_log:{}", agent_id);
@@ -2846,7 +2889,7 @@ pub async fn install_agent<R: Runtime>(
     // `detect_on_native_path` re-reads the registry PATH at runtime on Windows
     // so a Node/npm installed after the app launched (or present in the registry
     // but not the GUI's snapshotted PATH) is found without an app restart.
-    if !detect_agent_installed(prereq.to_string(), None)
+    if !probe_agent_installed(prereq.to_string(), None)
         .await
         .installed
     {
@@ -6373,15 +6416,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn curl_agent_installers_propagate_download_failures() {
-        for agent_id in [
-            "goose",
-            "atomic-agent",
-            "hermes",
-            "poolside",
-            "zed",
-            "muse",
-            "stack-agent",
-        ] {
+        for agent_id in ["goose", "atomic-agent", "hermes", "poolside", "zed", "muse"] {
             let (program, arguments, prerequisite, _) =
                 agent_install_spec(agent_id).expect("known install spec");
             assert_eq!(program, "bash", "{agent_id} must support pipefail");
@@ -6394,6 +6429,13 @@ mod tests {
                 "{agent_id} must fail when curl fails: {arguments:?}"
             );
         }
+    }
+
+    /// stack-agent is prepared by the runtime manager into Atomic Chat's own
+    /// cache, never installed globally with curl or `cargo install`.
+    #[test]
+    fn stack_agent_has_no_global_installer() {
+        assert!(agent_install_spec("stack-agent").is_err());
     }
 }
 

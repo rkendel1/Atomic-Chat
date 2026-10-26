@@ -9,7 +9,11 @@ import {
   withTranslations,
   XL_FONT_SIZE,
 } from '@/test/layout'
-import { run, task } from '@/lib/agent-bench/__tests__/fixtures'
+import {
+  run,
+  runtimeStatus,
+  task,
+} from '@/lib/agent-bench/__tests__/fixtures'
 import type { RunRecord } from '@/lib/agent-bench/types'
 
 import { AgentBenchPage } from '../index'
@@ -63,6 +67,15 @@ const runs = [claudeRun, stackRun]
 
 vi.mock('@/lib/agent-bench/api', () => ({
   RUN_UPDATED_EVENT: 'agent_bench:run_updated',
+  RUNTIME_STATUS_EVENT: 'stack_agent_runtime:status',
+  RUNTIME_LOG_EVENT: 'stack_agent_runtime:log',
+  runtimeApi: {
+    status: vi.fn(async () => runtimeStatus()),
+    refresh: vi.fn(),
+    prepareRevision: vi.fn(),
+    select: vi.fn(),
+    rollback: vi.fn(),
+  },
   benchApi: {
     overview: vi.fn(async () => ({
       adapters: [
@@ -141,6 +154,9 @@ describe('Agent Workshop page', () => {
     expect(await screen.findByText(task.goal)).toBeTruthy()
     expect(screen.getByText('cargo test')).toBeTruthy()
     expect(screen.getByText('Run history')).toBeTruthy()
+    // The runtime the stack-agent runs will use, and its evidence.
+    expect(screen.getByText('Stack-Agent runtime')).toBeTruthy()
+    expect(screen.getByTestId('runtime-status').textContent).toBe('Current')
     // Both runs are listed, newest first.
     const boxes = screen.getAllByRole('checkbox', { name: 'Compare' })
     expect(boxes).toHaveLength(2)

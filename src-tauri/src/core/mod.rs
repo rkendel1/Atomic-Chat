@@ -23,6 +23,7 @@ pub mod process_reaper;
 pub mod secure_env;
 pub mod server;
 pub mod sessions;
+pub mod stack_agent_runtime;
 pub mod setup;
 pub mod state;
 pub mod system;

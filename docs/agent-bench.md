@@ -21,10 +21,12 @@ Code: `src-tauri/src/core/agent_bench/` (Rust), `web-app/src/routes/bench/`,
 
 1. Load a local model and start the Local API Server (Server → Overview). The bench starts the
    server itself when a run needs it, but a model must be loaded.
-2. Install the agents from the **Launch** page: `stack-agent` (plus [`pax`](https://github.com/rkendel1/pax)
-   0.4.1+ on your `PATH`; stack-agent's `change` work completes only through a passing `pax test`)
-   and, optionally, Claude Code. `cargo` must be on your login-shell `PATH` for the bundled
-   benchmark's checks.
+2. Prepare stack-agent with **Prepare** in Agent Bench's *Stack-Agent runtime* panel (or
+   **Install** on the Launch page). This builds the latest `main` into Atomic Chat's own cache and
+   keeps it current; it needs git and [rustup](https://rustup.rs). Also put
+   [`pax`](https://github.com/rkendel1/pax) 0.4.1+ on your `PATH`: stack-agent's `change` work
+   completes only through a passing `pax test`. Optionally install Claude Code from the Launch
+   page. `cargo` must be on your login-shell `PATH` for the bundled benchmark's checks.
 3. Open **Agent Bench**, pick a ★ bundled task, tick the agents, check the model, press **Run**.
 4. Open a run in **Run history** to see the command, exit status, output, verification checks,
    changed files and configuration. Tick two or more runs to compare them.
@@ -97,16 +99,101 @@ Actionable errors are recorded on the run: missing executable ("install it from 
 no model selected, Local API Server unreachable (checked before the agent starts), and the agent's
 own `error:` lines.
 
+## Stack-Agent runtime
+
+stack-agent runs (in Agent Bench and from the Launch page) use the runtime Atomic Chat manages
+(`src-tauri/src/core/stack_agent_runtime`; decision:
+[2026-10-26](decisions/2026-10-26-manage-the-stack-agent-runtime-from-pinned-main-commits.md)).
+Nothing is installed globally, and nobody runs a build or upgrade command.
+
+1. **Resolve.** `git ls-remote https://github.com/rkendel1/stack-agent refs/heads/main` gives a
+   full commit id.
+2. **Reuse.** If that commit is already cached for this platform and its executable still has the
+   SHA-256 recorded at validation, it is used as is.
+3. **Prepare.** In a staging directory: shallow-fetch exactly that commit and check `HEAD`. Then
+   `rustup toolchain install` (the repository's `rust-toolchain.toml`) and
+   `cargo build --release --locked --bin stack-agent` (the release workflow's command), with
+   cargo's target directory shared across revisions. Inherited toolchain and build overrides
+   (`RUSTUP_TOOLCHAIN`, `RUSTFLAGS`, `CARGO_BUILD_*`, `CARGO_PROFILE_*`, …) are removed.
+4. **Validate.** `--version` must report `stack-agent X.Y.Z`, the offline `--test` must complete a
+   turn, and `work --help` must offer `--kind --json --deadline-secs --max-turns --max-executions
+   --print-reply --state-db`.
+5. **Activate.** The staging directory is renamed into the cache, then `state.json` is rewritten
+   atomically. The previous runtime (and the last three) is kept for rollback.
+6. **Fall back within `main`.** If the tip of `main` fails to build or validate, up to three of its
+   first-parent ancestors (never older than the active runtime) are tried, and the newest that
+   passes is activated. The status stays **Update failed**, naming the tip and the error, because
+   the tip itself could not be prepared.
+
+**When it refreshes.** 20 s after start and every 6 h, plus **Refresh** in the runtime panel or
+**Install** on the Launch page. Background checks start only once someone has prepared a runtime.
+A failed check, fetch, build or validation keeps the active runtime and is shown. An automatic
+refresh does not retry a revision that failed, or one a developer rolled back from; a manual
+refresh does. Interrupted preparations leave only a staging directory, which the next refresh
+removes. One refresh runs at a time across processes.
+
+**Runtime panel (Agent Bench).**
+- *Status*:
+  - **Current**: the active commit is `main`, checked in the last 24 h.
+  - **Update available**
+  - **Refreshing**: shows the build progress.
+  - **Update failed**: shows the stage and error.
+  - **May be stale**: the check failed or is old; the last evidence is shown.
+  - **Pinned**
+  - **Unmanaged**: only a `stack-agent` on `PATH` exists; its revision is unknown.
+  - **Not prepared**
+- *Details*: the active revision and version, its source, `main` as last seen and when, and the
+  last successful refresh.
+- *Actions*: **Refresh**/**Prepare** and **Roll back**.
+- *Revision for runs*: **Follow main** (default) or a cached revision to pin for a controlled
+  comparison. A pinned revision is never replaced by a refresh. If it becomes unusable, runs fail
+  with that error rather than switching.
+
+**Which executable a run uses**, in order:
+1. A path set on the Launch page (recorded as `custom_path`).
+2. The pinned revision.
+3. The active managed runtime.
+4. An unmanaged `stack-agent` on `PATH` (recorded as `external`, commit unknown).
+
+The run resolves once, before it starts, and holds a lease, so activating or pruning another
+runtime never changes what a run executes. Just before launching, the executor hashes the program
+it is about to start and refuses to run it if the hash differs from the recorded
+`binary_sha256`. So the recorded commit and digest are those of the file that ran.
+
+Workshop runs, regression tasks and suite runs all take this path. A **suite run** resolves the
+runtime once and gives that same managed executable to every entry, so a refresh in the middle of
+a suite cannot split it across revisions.
+
+**Provenance.** Every stack-agent run records `agent.runtime`:
+- `source`: `managed`, `custom_path` or `external`;
+- `selection`: `follow_main`, `pinned`, `custom_path` or `external`;
+- `commit`, `version`, `platform`, `binary_sha256`, `repository`, `toolchain` and `prepared_at`;
+- `latest_known_main`, `latest_checked_at` and `matches_latest`.
+
+The run detail shows these and offers **Use this revision**, which prepares the recorded commit if
+needed and pins it so the run can be reproduced. That works as long as the commit, its
+dependencies and the model are still available.
+
+Claude Code and other agents keep their own installation and are not affected.
+
 ## Comparison
 
 Tick runs in **Run history**. For each run: task outcome (and whether it was *verified*, a *human*
 judgment, or *not verified*), duration, checks passed/failed, process status, change counts
-(added/modified/deleted), agent + version, model + provider. Anything not recorded shows
+(added/modified/deleted), agent + version, the Stack-Agent revision, model + provider. Anything not recorded shows
 **Unavailable** with the reason on hover — no value is invented.
 
 The first ticked run is the reference. Runs that differ from it in task or task version,
 evaluation, project/fixture, model, provider, Atomic Chat version — or, for runs of the same agent,
-agent version or configuration — are flagged **Not directly comparable** with the differing values.
+agent version, Stack-Agent revision or configuration — are flagged **Not directly comparable** with the
+differing values. The differences are grouped by what they can explain:
+- **agent runtime**: agent version or Stack-Agent revision;
+- **model or inference configuration**: model, provider or agent configuration;
+- **task, evaluation or fixture**;
+- **other execution settings**: Atomic Chat version, or a run still in progress.
+
+A revision that is unknown (a run made before runtime management, or an unmanaged executable) is
+never treated as equal to another.
 Different agents are what is being compared and are not flagged. Runs of different tasks are
 marked as not comparable at all.
 
@@ -228,8 +315,11 @@ Aggregation never counts an unverified run either way:
 Pick a baseline and a candidate suite run to compare. A task is an **improvement** or
 **regression** only if both sides verified it at the same task version and the same baseline;
 otherwise it is **not comparable**, with the reason. Warnings list every condition that differs:
-suite version, agent, agent version, model, provider, configuration (same agent only) and app
-version — and conditions recorded as unknown, which cannot be confirmed equal.
+suite version, agent, agent version, Stack-Agent revision (`agent_revision`, same agent only),
+model, provider, configuration (same agent only) and app version, and conditions recorded as
+unknown, which cannot be confirmed equal. A stack-agent run with no recorded runtime (made before
+runtime management, or an unmanaged executable) has an unknown revision. Other agents have no
+managed runtime and are "not applicable", never unknown.
 
 ## Failures — what to fix next
 
@@ -257,6 +347,10 @@ agent, model settings or code.
 Run records written before the workshop load unchanged and are analyzed when read (nothing is
 rewritten).
 
+The stack-agent runtime cache is beside it, in `<Atomic Chat data folder>/stack-agent-runtime/`:
+`state.json`, `runtimes/<arch>-<os>/<commit>/` (`bin/stack-agent` and `runtime.json`, its
+manifest with the health checks), `build/` (cargo's target directory) and `staging/`.
+
 Each record is written to a temporary file and renamed, so a crash never leaves half a record. A
 damaged file is skipped (and logged), never hides the others.
 
@@ -280,7 +374,10 @@ review are included, with `final_status: "evaluating"`).
   "final_status": "succeeded",
   "failure_kind": null,
   "terminal": true,
-  "observed": {"agent_id": "stack-agent", "agent_version": "stack-agent 0.1.0", "model": "…", "provider": "atomic-chat-local-api",
+  "observed": {"agent_id": "stack-agent", "agent_version": "stack-agent 0.1.0", "agent_revision": "<commit>",
+               "agent_runtime": {"source": "managed", "selection": "follow_main", "commit": "<commit>", "version": "0.1.0",
+                                 "binary_sha256": "<sha256>", "latest_known_main": "<commit>", "matches_latest": true, "…": "…"},
+               "model": "…", "provider": "atomic-chat-local-api",
                "config": {"CHIP_MODEL": "…", "kind": "change", "…": "…"}, "credential_supplied": true, "app_version": "…",
                "workdir_source": "fixture", "started_at": "…", "finished_at": "…", "duration_ms": 1423,
                "execution_outcome": "exited", "exit_code": 0, "changes": {"added": [], "modified": ["src/pricing.rs"], "deleted": []}, "…": "…"},
@@ -294,7 +391,7 @@ review are included, with `final_status: "evaluating"`).
 
 | Section | Holds |
 | --- | --- |
-| `observed` | Facts Atomic Chat saw: agent, version, method, model, provider, endpoint, config, versions, times, process outcome, exit code/signal, output sizes, changes, cancellation, interruption, errors |
+| `observed` | Facts Atomic Chat saw: agent, version, Stack-Agent revision and runtime (`agent_revision`, `agent_runtime`; `null` and not "unknown" for other agents), method, model, provider, endpoint, config, versions, times, process outcome, exit code/signal, output sizes, changes, cancellation, interruption, errors |
 | `verified` | What the verification commands established, per check; `outcome` is `null` for manual evaluation or when verification never ran |
 | `human` | A reviewer's verdict, note and time, or `null` |
 | `agent_claims` | The agent's own statements about its work. Not evidence |
@@ -338,10 +435,40 @@ weights.
   without touching their source, task-version archiving, suite denominators and exclusions,
   comparison warnings, the failure summary, compatibility with records written before the
   workshop, and the whole loop with fake stack-agent executables (`work` and `agent-state show`).
-- Web: `web-app/src/lib/agent-bench/__tests__` (run comparison, stop point, rate, command-line
-  parsing) and the real-browser layout suite: `routes/bench/__tests__/AgentBenchPage.layout.test.tsx`
-  and `containers/agent-bench/__tests__/RunInspector.layout.test.tsx` (inspector with complete,
-  partial and missing evidence).
+- Rust, runtime manager: `cargo test --lib stack_agent_runtime`. A fake source whose "builds" are
+  shell scripts covers:
+  - first acquisition, reuse without a rebuild, and a newer `main`;
+  - build failure and fallback, health-check rejection, and tampered executables;
+  - interrupted preparation, rollback, pinning, and concurrent and cross-process refreshes;
+  - offline start, staleness, pruning with leases, unmanaged executables, and credentials.
+
+  `agent_bench::tests_runtime` runs Workshop tasks through managed runtimes via the same
+  `prepare_run` the app uses. It checks:
+  - the recorded commit, path and executable digest are those of what ran;
+  - a refresh during a run neither changes nor prunes its runtime;
+  - an executable changed after resolution is never launched;
+  - a pinned historical revision reproduces after `main` moves;
+  - a suite run keeps one runtime, and regression tasks and suites still work;
+  - unknown provenance is never comparable, and other agents are not asked for one;
+  - the export keeps the Workshop sections and adds the runtime;
+  - records written before runtime provenance still load.
+- Web: `web-app/src/lib/agent-bench/__tests__`:
+  - run comparison, including revision attribution and causes;
+  - stop point, rate and command-line parsing.
+
+  Real-browser layout suites:
+  - `routes/bench/__tests__/AgentBenchPage.layout.test.tsx`;
+  - `containers/agent-bench/__tests__/RunInspector.layout.test.tsx`: the inspector with complete,
+    partial and missing evidence;
+  - `containers/agent-bench/__tests__/RuntimePanel.layout.test.tsx`: current, stale, refreshing,
+    failed, pinned and not-prepared states.
+- Real runtime, opt-in: resolves, fetches, builds, validates and activates the real `main`, reuses
+  it, then starts "offline" from the cache:
+
+  ```sh
+  cd src-tauri
+  ATOMIC_RUNTIME_ROOT=/tmp/runtime cargo test --lib live_acquire_main -- --ignored --nocapture
+  ```
 - Real agent, opt-in — runs the installed agent through the same executor and prints the record and
   its export line:
 

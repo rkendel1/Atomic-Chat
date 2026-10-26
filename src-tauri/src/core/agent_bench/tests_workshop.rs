@@ -1068,6 +1068,27 @@ fn suite_aggregation_shows_its_denominator_and_exclusions() {
     );
 }
 
+const REVISION: &str = "d66cf80fd946e8df7f502bf2f30cecab98f1c38f";
+
+/// The provenance the runtime manager records for a managed stack-agent.
+fn managed_runtime(commit: &str) -> crate::core::stack_agent_runtime::RuntimeProvenance {
+    crate::core::stack_agent_runtime::RuntimeProvenance {
+        source: "managed".into(),
+        selection: "follow_main".into(),
+        path: format!("/data/stack-agent-runtime/runtimes/x86_64-linux/{commit}/bin/stack-agent"),
+        commit: Some(commit.into()),
+        version: Some("0.1.0".into()),
+        platform: "x86_64-linux".into(),
+        binary_sha256: Some("f".repeat(64)),
+        repository: Some("https://github.com/rkendel1/stack-agent".into()),
+        toolchain: None,
+        prepared_at: None,
+        latest_known_main: Some(commit.into()),
+        latest_checked_at: None,
+        matches_latest: Some(true),
+    }
+}
+
 #[test]
 fn suite_comparison_finds_changes_and_flags_incomparable_conditions() {
     let data = tempfile::tempdir().unwrap();
@@ -1090,6 +1111,7 @@ fn suite_comparison_finds_changes_and_flags_incomparable_conditions() {
         r.id = id.into();
         r.model = Some(model.into());
         r.agent.version = Some(version.into());
+        r.agent.runtime = Some(managed_runtime(REVISION));
         r
     };
     for (id, ok, model, v) in [
@@ -1107,6 +1129,7 @@ fn suite_comparison_finds_changes_and_flags_incomparable_conditions() {
     interrupted.model = Some("m".into());
     interrupted.provider = Some("atomic-chat-local-api".into());
     interrupted.agent.version = Some("0.1.0".into());
+    interrupted.agent.runtime = Some(managed_runtime(REVISION));
     runs.insert("c3".into(), {
         interrupted.id = "c3".into();
         interrupted
@@ -1144,6 +1167,23 @@ fn suite_comparison_finds_changes_and_flags_incomparable_conditions() {
     assert!(w
         .iter()
         .any(|w| w.field == "provider" && w.baseline == "unknown"));
+
+    // A different stack-agent revision is flagged, and so is one nobody
+    // recorded (a run from before runtime management).
+    let mut moved = runs.clone();
+    moved.get_mut("c2").unwrap().agent.runtime = Some(managed_runtime(&"e".repeat(40)));
+    let w = regression_suite::compare(&base, &cand, &moved).warnings;
+    assert!(w.iter().any(|w| w.field == "agent_revision"
+        && w.baseline == REVISION
+        && w.candidate.starts_with("mixed")));
+    let mut legacy = runs.clone();
+    for r in legacy.values_mut() {
+        r.agent.runtime = None;
+    }
+    let w = regression_suite::compare(&base, &cand, &legacy).warnings;
+    assert!(w
+        .iter()
+        .any(|w| w.field == "agent_revision" && w.baseline == "unknown"));
 
     // A different model and agent version are flagged, not hidden.
     runs.insert("c1".into(), mk("c1", true, "other-model", "0.2.0"));

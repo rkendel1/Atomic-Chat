@@ -48,6 +48,13 @@ const EXPECTED_DESKTOP_ONLY = new Set([
   'bench_list_suite_runs',
   'bench_compare_suite_runs',
   'bench_failure_summary',
+  // The stack-agent runtime manager builds and launches stack-agent, which
+  // only Agent Bench and the Launch page's desktop terminal use.
+  'stack_agent_runtime_prepare_revision',
+  'stack_agent_runtime_refresh',
+  'stack_agent_runtime_rollback',
+  'stack_agent_runtime_select',
+  'stack_agent_runtime_status',
   // ChatGPT subscription sign-in. Desktop only on purpose: the OAuth callback
   // needs a loopback listener on a fixed port, and the refresh token needs a
   // mode-0600 file. `PlatformFeature.CHATGPT_SUBSCRIPTION` gates the UI to

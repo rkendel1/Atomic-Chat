@@ -211,6 +211,9 @@ pub struct AgentRef {
     /// First line of `<agent> --version`, when it answered.
     #[serde(default)]
     pub version: Option<String>,
+    /// stack-agent only: the exact runtime that ran, from the runtime manager.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<crate::core::stack_agent_runtime::RuntimeProvenance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

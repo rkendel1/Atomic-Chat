@@ -369,6 +369,22 @@ fn conditions(sr: &SuiteRun, runs: &HashMap<String, RunRecord>) -> BTreeMap<&'st
         "agent_version",
         pick(&|r| r.agent.version.clone().unwrap_or_else(|| "unknown".into())),
     );
+    // The exact stack-agent build each run executed. Other agents have no
+    // managed runtime: "not applicable", never "unknown".
+    m.insert(
+        "agent_revision",
+        pick(&|r| {
+            if r.agent.id == "stack-agent" {
+                r.agent
+                    .runtime
+                    .as_ref()
+                    .and_then(|rt| rt.commit.clone())
+                    .unwrap_or_else(|| "unknown".into())
+            } else {
+                "not applicable".into()
+            }
+        }),
+    );
     m.insert(
         "model",
         pick(&|r| r.model.clone().unwrap_or_else(|| "unknown".into())),
@@ -410,7 +426,7 @@ pub fn compare(
     for (k, bv) in &bc {
         let cv = &cc[k];
         // Configuration naturally differs between agents; compare it only for one agent.
-        if *k == "config" && base.agent_id != cand.agent_id {
+        if (*k == "config" || *k == "agent_revision") && base.agent_id != cand.agent_id {
             continue;
         }
         if bv != cv || bv.starts_with("mixed") || bv == "unknown" && *k != "config" {

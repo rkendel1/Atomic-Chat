@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { compareRuns } from '../compare'
 import type { BenchTask } from '../types'
-import { run, task } from './fixtures'
+import { REVISION_A, run, runtime, task } from './fixtures'
 
 describe('compareRuns', () => {
   it('reports the metrics of each run', () => {
@@ -168,5 +168,85 @@ describe('compareRuns', () => {
       sameTask: true,
       directlyComparable: true,
     })
+  })
+})
+
+describe('compareRuns: what a difference is attributed to', () => {
+  const B = '4850da9f0000000000000000000000000000beef'
+
+  it('attributes a changed Stack-Agent revision to the agent runtime', () => {
+    const newer = run({
+      id: 'run_b',
+      agent: { ...run().agent, runtime: runtime({ commit: B }) },
+    })
+    const cmp = compareRuns([run(), newer])
+    expect(cmp.rows[1].differences).toEqual(['agent_revision'])
+    expect(cmp.issues).toEqual([
+      {
+        field: 'agent_revision',
+        cause: 'agent_runtime',
+        values: [
+          `stack-agent: ${REVISION_A.slice(0, 12)}`,
+          `stack-agent: ${B.slice(0, 12)}`,
+        ],
+      },
+    ])
+    expect(cmp.rows[1].agentRevision).toEqual({ available: true, value: B })
+    expect(cmp.directlyComparable).toBe(false)
+  })
+
+  it('keeps runtime, model, task and execution differences apart', () => {
+    const other = run({
+      id: 'run_b',
+      model: 'qwen2.5-coder-3b',
+      app_version: '2.3.0',
+      task: { ...run().task, version: 2, digest: 'd2' },
+      agent: { ...run().agent, runtime: runtime({ commit: B }) },
+    })
+    const cmp = compareRuns([run(), other])
+    expect(cmp.issues.map((i) => [i.cause, i.field])).toEqual([
+      ['agent_runtime', 'agent_revision'],
+      ['model', 'model'],
+      ['task', 'task_version'],
+      ['execution', 'app_version'],
+    ])
+  })
+
+  it('never treats an unknown revision as the same revision', () => {
+    const unmanaged = run({
+      id: 'run_b',
+      agent: {
+        ...run().agent,
+        runtime: runtime({ source: 'external', selection: 'external', commit: null }),
+      },
+    })
+    const legacy = run({
+      id: 'run_c',
+      agent: { ...run().agent, runtime: undefined },
+    })
+    const cmp = compareRuns([run(), unmanaged, legacy])
+    expect(cmp.rows[1].differences).toContain('agent_revision')
+    expect(cmp.rows[2].differences).toContain('agent_revision')
+    expect(cmp.rows[1].agentRevision.available).toBe(false)
+    expect(cmp.rows[2].agentRevision).toEqual({
+      available: false,
+      reason: 'runtime not recorded',
+    })
+  })
+
+  it('does not ask other agents for a Stack-Agent revision', () => {
+    const claude = run({
+      id: 'run_b',
+      agent: {
+        id: 'claude-code',
+        name: 'Claude Code',
+        execution_method: 'cli:claude -p',
+        executable: '/bin/claude',
+        version: '2.0.0',
+      },
+    })
+    const cmp = compareRuns([run(), claude])
+    expect(cmp.rows[1].differences).not.toContain('agent_revision')
+    expect(cmp.rows[1].agentRevision.available).toBe(false)
   })
 })

@@ -489,14 +489,22 @@ function LaunchPage() {
             ]
             const hint =
               'Next: cd into your project, then run  stack-agent work "Fix the failing test"'
+            // The runtime Atomic Chat manages is not on PATH; put its
+            // directory first so the hint's bare `stack-agent` runs it.
+            const managed = useLaunchStore.getState().binPath[agent.id]
+            const binDir = managed
+              ? managed.replace(/[\\/][^\\/]+$/, '')
+              : null
             if (osType() === 'windows') {
               const sets = env.map(([k, v]) => `set ${k}=${v}&& `).join('')
-              command = `${sets}${launcher} doctor & echo. & echo ${hint}`
+              const path = binDir ? `set PATH=${binDir};%PATH%&& ` : ''
+              command = `${sets}${path}${launcher} doctor & echo. & echo ${hint}`
             } else {
               const exports = env
                 .map(([k, v]) => `export ${k}='${v}'`)
                 .join('; ')
-              command = `${exports}; ${launcher} doctor; echo; echo '${hint}'`
+              const path = binDir ? `; export PATH='${binDir}':"$PATH"` : ''
+              command = `${exports}${path}; ${launcher} doctor; echo; echo '${hint}'`
             }
           } else if (agent.id === 'poolside') {
             const apiUrl = `http://${agentConnectHost(serverHost)}:${serverPort}${apiPrefix}`
