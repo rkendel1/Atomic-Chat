@@ -116,7 +116,7 @@ pub(crate) fn detect_configured_agents_in(
     let block = |marker: &str| shell_block_vars(&rc, marker);
     let user_env_is_local = |name: &str| user_env(name).is_some_and(|v| is_local_url(&v));
 
-    let checks: [(&str, bool); 19] = [
+    let checks: [(&str, bool); 20] = [
         (
             "kilo",
             json_file(&home.join(".config").join("kilo").join("kilo.jsonc"))
