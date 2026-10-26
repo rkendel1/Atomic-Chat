@@ -148,6 +148,8 @@ fn builtin(
         builtin: true,
         created_at: String::new(),
         updated_at: String::new(),
+        origin: None,
+        expected: None,
     }
 }
 

@@ -8,7 +8,9 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::adapters::{self, Launch};
+use super::baseline;
 use super::changes;
+use super::evidence::{self, AgentTrace};
 use super::process::{self, Ending, Spec};
 use super::redact::Redactor;
 use super::run::*;
@@ -31,6 +33,15 @@ pub fn new_record(store: &Store, task: &BenchTask, agent_id: &str, app_version: 
                 .to_string_lossy()
                 .into_owned(),
             fixture: Some(fixture.clone()),
+        },
+        WorkdirRef::GitSnapshot { commit, .. } => WorkdirInfo {
+            source: "git_snapshot".to_string(),
+            path: store
+                .workspaces_dir()
+                .join(&id)
+                .to_string_lossy()
+                .into_owned(),
+            fixture: Some(format!("git:{commit}")),
         },
         WorkdirRef::Path { path } => WorkdirInfo {
             source: "path".to_string(),
@@ -94,6 +105,10 @@ pub fn new_record(store: &Store, task: &BenchTask, agent_id: &str, app_version: 
             status: RunStatus::Queued,
             at: created_at,
         }],
+        baseline: None,
+        agent_trace: None,
+        analysis: None,
+        suite: None,
     }
 }
 
@@ -134,8 +149,15 @@ pub async fn execute(ctx: Context, mut run: RunRecord) -> RunRecord {
 
     let task = run.task.snapshot.clone();
     let workdir = PathBuf::from(&run.workdir.path);
-    if let Err(e) = prepare_workdir(&task, &workdir) {
-        return fail_execution(&ctx, run, e, None);
+    let prepared = {
+        let (w, d, p) = (task.workdir.clone(), workdir.clone(), ctx.path_env.clone());
+        tokio::task::spawn_blocking(move || baseline::prepare(&w, &d, &p))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+    };
+    match prepared {
+        Ok(b) => run.baseline = Some(b),
+        Err(e) => return fail_execution(&ctx, run, e, None),
     }
     let launch = match ctx.launch.clone() {
         Ok(l) => l,
@@ -175,6 +197,7 @@ pub async fn execute(ctx: Context, mut run: RunRecord) -> RunRecord {
         stderr_limit: process::STDERR_LIMIT,
     };
     let command_line = redactor.text(&display_command(&launch.program, &launch.args));
+    let agent_started_at = now();
     let finished = match process::run(spec, &ctx.cancel).await {
         Ok(f) => f,
         Err(e) => return fail_execution(&ctx, run, e, Some(&launch)),
@@ -227,12 +250,27 @@ pub async fn execute(ctx: Context, mut run: RunRecord) -> RunRecord {
         },
         agent_report: report.map(|r| redactor.json(&r)),
         error,
+        started_at: Some(agent_started_at),
+        ended_at: Some(now()),
     });
     run.changes = Some(changes::compare(&before, &changes::snapshot(&workdir)));
+    let report_ref = run.execution.as_ref().and_then(|e| e.agent_report.clone());
+    run.agent_trace = Some(
+        collect_trace(
+            &run.agent.id,
+            &launch,
+            report_ref.as_ref(),
+            &stderr.text,
+            &workdir,
+            &ctx.path_env,
+            &redactor,
+        )
+        .await,
+    );
     run.artifacts.push(Artifact {
         kind: "workdir".to_string(),
         reference: run.workdir.path.clone(),
-        description: if run.workdir.source == "fixture" {
+        description: if run.workdir.source != "path" {
             "Isolated copy of the fixture, as the agent left it".to_string()
         } else {
             "The project the agent changed in place".to_string()
@@ -268,6 +306,7 @@ async fn evaluate(
     match &task.evaluation {
         Evaluation::Manual { .. } => {
             run.evaluation.awaiting_review = true;
+            run.reanalyze();
         }
         Evaluation::Command {
             commands,
@@ -295,6 +334,7 @@ async fn evaluate(
                         stdout: Default::default(),
                         stderr: Default::default(),
                         error: Some("run cancelled".to_string()),
+                        started_at: None,
                     }
                 } else {
                     run_check(c, workdir, &ctx.path_env, &ctx.cancel, redactor).await
@@ -349,6 +389,7 @@ async fn run_check(
     redactor: &Redactor,
 ) -> CheckResult {
     let command_line = c.display();
+    let started_at = Some(now());
     let program = resolve_program(&c.program, path_env);
     let env = vec![("PATH".to_string(), path_env.to_string())];
     let spec = Spec {
@@ -371,6 +412,7 @@ async fn run_check(
             stdout: Default::default(),
             stderr: Default::default(),
             error: Some(redactor.text(&e)),
+            started_at,
         },
         Ok(f) => {
             let outcome = match f.ending {
@@ -396,6 +438,7 @@ async fn run_check(
                     ..err
                 },
                 error: None,
+                started_at,
             }
         }
     }
@@ -408,30 +451,6 @@ fn resolve_program(program: &str, path_env: &str) -> PathBuf {
         return PathBuf::from(program);
     }
     adapters::search_path(program, path_env).unwrap_or_else(|| PathBuf::from(program))
-}
-
-fn prepare_workdir(task: &BenchTask, workdir: &Path) -> Result<(), String> {
-    match &task.workdir {
-        WorkdirRef::Fixture { fixture } => {
-            if workdir.exists() {
-                return Err(format!(
-                    "workspace {} already exists; refusing to reuse it",
-                    workdir.display()
-                ));
-            }
-            suite::materialize(fixture, workdir)
-        }
-        WorkdirRef::Path { .. } => {
-            if workdir.is_dir() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "project directory {} does not exist",
-                    workdir.display()
-                ))
-            }
-        }
-    }
 }
 
 fn fail_execution(
@@ -454,6 +473,8 @@ fn fail_execution(
         stderr: Default::default(),
         agent_report: None,
         error: Some(error.clone()),
+        started_at: None,
+        ended_at: None,
     });
     run.errors.push(error);
     run.failure_kind = Some(FailureKind::Execution);
@@ -530,13 +551,18 @@ fn display_command(program: &Path, args: &[String]) -> String {
     parts.join(" ")
 }
 
-/// The last `error:` lines an agent wrote, or its last non-empty line.
+/// The last `error:` lines an agent wrote, or its last non-empty line. When
+/// the agent printed model replies, only `error:` lines count: the last line
+/// would be part of a reply, i.e. the model's words.
 fn last_error_lines(stderr: &str) -> Option<String> {
     let errors: Vec<&str> = stderr
         .lines()
         .filter(|l| l.trim_start().to_ascii_lowercase().starts_with("error"))
         .collect();
     let picked = if errors.is_empty() {
+        if stderr.contains("Model reply:\n") {
+            return None;
+        }
         stderr
             .lines()
             .rev()
@@ -546,4 +572,79 @@ fn last_error_lines(stderr: &str) -> Option<String> {
         errors[errors.len().saturating_sub(3)..].join("\n")
     };
     Some(picked.chars().take(2000).collect())
+}
+
+/// Reads the agent's own trajectory through its adapter's interface, and the
+/// model replies it printed. Whatever cannot be read is recorded as missing,
+/// with the reason.
+async fn collect_trace(
+    agent_id: &str,
+    launch: &Launch,
+    report: Option<&serde_json::Value>,
+    stderr: &str,
+    cwd: &Path,
+    path_env: &str,
+    redactor: &Redactor,
+) -> AgentTrace {
+    let mut trace = AgentTrace {
+        source: adapters::STACK_AGENT_TRACE_SOURCE.to_string(),
+        ..Default::default()
+    };
+    if agent_id != "stack-agent" {
+        trace.source = format!("{agent_id} (no trajectory interface)");
+    }
+    if launch.config.get("print_reply").map(String::as_str) == Some("true") {
+        trace.replies = evidence::parse_print_replies(stderr, 8 * 1024)
+            .into_iter()
+            .map(|mut r| {
+                r.text = redactor.text(&r.text);
+                r
+            })
+            .collect();
+    } else {
+        trace.replies_unavailable_reason = Some(format!(
+            "{agent_id} does not print its model replies to Agent Bench"
+        ));
+    }
+    let args = match adapters::trace_command(agent_id, launch, report) {
+        Ok(a) => a,
+        Err(e) => {
+            trace.unavailable_reason = Some(redactor.text(&e));
+            return trace;
+        }
+    };
+    let env = vec![("PATH".to_string(), path_env.to_string())];
+    let spec = Spec {
+        program: &launch.program,
+        args: &args,
+        cwd,
+        env: &env,
+        env_remove: &[],
+        timeout: Duration::from_secs(60),
+        stdout_limit: process::STDOUT_LIMIT,
+        stderr_limit: 16 * 1024,
+    };
+    match process::run(spec, &CancellationToken::new()).await {
+        Ok(f) if f.ending == Ending::Exited && f.exit_code == Some(0) => {
+            match serde_json::from_slice::<serde_json::Value>(&f.stdout) {
+                Ok(show) => {
+                    trace.events = adapters::stack_agent_trace(&show, redactor);
+                    trace.available = true;
+                }
+                Err(e) => {
+                    trace.unavailable_reason =
+                        Some(format!("agent-state show printed no readable JSON: {e}"))
+                }
+            }
+        }
+        Ok(f) => {
+            trace.unavailable_reason = Some(redactor.text(&format!(
+                "agent-state show did not succeed (exit {:?}): {}",
+                f.exit_code,
+                String::from_utf8_lossy(&f.stderr).trim()
+            )))
+        }
+        Err(e) => trace.unavailable_reason = Some(redactor.text(&e)),
+    }
+    trace
 }

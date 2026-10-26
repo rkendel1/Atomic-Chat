@@ -95,6 +95,21 @@ vi.mock('@/lib/agent-bench/api', () => ({
     listTasks: vi.fn(async () => [task]),
     listRuns: vi.fn(async () => runs),
     getRun: vi.fn(async (id: string) => runs.find((r) => r.id === id)),
+    inspectRun: vi.fn(async (id: string) => ({
+      run: runs.find((r) => r.id === id),
+      prompt: task.goal,
+      timeline: [],
+      signals: [],
+    })),
+    listSuites: vi.fn(async () => []),
+    listSuiteRuns: vi.fn(async () => []),
+    failureSummary: vi.fn(async () => ({
+      runs_considered: 2,
+      succeeded: 1,
+      not_succeeded: 1,
+      excluded: 0,
+      categories: [],
+    })),
     startRun: vi.fn(),
     cancelRun: vi.fn(),
     submitReview: vi.fn(),
@@ -118,7 +133,7 @@ async function mount() {
   return view
 }
 
-describe('Agent Bench page', () => {
+describe('Agent Workshop page', () => {
   beforeEach(() => setFontSize(DEFAULT_FONT_SIZE))
 
   it('shows the task, the run settings and the persisted history', async () => {
@@ -151,12 +166,27 @@ describe('Agent Bench page', () => {
         fireEvent.click(screen.getAllByText(task.name)[0])
         await settle()
       })
-      expect(await screen.findByText('Run details')).toBeTruthy()
+      expect(await screen.findByText('Run inspector')).toBeTruthy()
       expect(screen.getByText('Verified outcome')).toBeTruthy()
+      expect(screen.getByText('Diagnosis')).toBeTruthy()
       expectNoHorizontalOverflow(
         view.container.firstElementChild as HTMLElement
       )
       view.unmount()
     }
+  })
+
+  it('switches to the suite and failure views without overflowing', async () => {
+    const view = await mount()
+    for (const tab of ['Regression suites', 'Failures']) {
+      await act(async () => {
+        fireEvent.click(screen.getByRole('tab', { name: tab }))
+        await settle()
+      })
+      expectNoHorizontalOverflow(
+        view.container.firstElementChild as HTMLElement
+      )
+    }
+    expect(screen.getByText(/2 runs: 1 failed or inconclusive/)).toBeTruthy()
   })
 })

@@ -98,3 +98,26 @@ pub fn compare(before: &Snapshot, after: &Snapshot) -> ChangeSummary {
     }
     summary
 }
+
+impl Snapshot {
+    /// SHA-256 over every compared file's path and fingerprint, in path order:
+    /// equal digests mean the same files with the same contents.
+    pub fn digest(&self) -> String {
+        let mut h = Sha256::new();
+        for (path, fp) in &self.files {
+            h.update(path.as_bytes());
+            h.update([0]);
+            h.update(fp.as_bytes());
+            h.update(b"\n");
+        }
+        hex::encode(h.finalize())
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn incomplete(&self) -> bool {
+        self.incomplete
+    }
+}

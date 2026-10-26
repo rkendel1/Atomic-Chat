@@ -42,6 +42,8 @@ fn path_task(dir: &Path, commands: Vec<VerificationCommand>) -> BenchTask {
         builtin: false,
         created_at: String::new(),
         updated_at: String::new(),
+        origin: None,
+        expected: None,
     }
 }
 
@@ -416,6 +418,7 @@ fn stack_agent_adapter_uses_the_documented_work_interface() {
         &task,
         &cfg("stack-agent", Some("http://127.0.0.1:1337/v1")),
         Path::new("/bin/stack-agent"),
+        None,
     )
     .unwrap();
     assert_eq!(launch.args[0], "work");
@@ -462,10 +465,11 @@ fn stack_agent_adapter_uses_the_documented_work_interface() {
             ..cfg("stack-agent", Some("http://127.0.0.1:1337/v1"))
         },
         Path::new("/bin/stack-agent"),
+        None,
     );
     assert!(missing.unwrap_err().contains("model"));
-    assert!(adapters::plan(&task, &cfg("stack-agent", None), Path::new("/x")).is_err());
-    assert!(adapters::plan(&task, &cfg("nobody", None), Path::new("/x")).is_err());
+    assert!(adapters::plan(&task, &cfg("stack-agent", None), Path::new("/x"), None).is_err());
+    assert!(adapters::plan(&task, &cfg("nobody", None), Path::new("/x"), None).is_err());
 }
 
 #[test]
@@ -476,6 +480,7 @@ fn claude_code_adapter_runs_print_mode() {
         &task,
         &cfg("claude-code", Some("http://127.0.0.1:1337")),
         Path::new("/bin/claude"),
+        None,
     )
     .unwrap();
     assert_eq!(launch.args[0], "-p");
@@ -493,7 +498,13 @@ fn claude_code_adapter_runs_print_mode() {
     );
     assert!(!format!("{:?}", launch.config).contains(KEY));
 
-    let own = adapters::plan(&task, &cfg("claude-code", None), Path::new("/bin/claude")).unwrap();
+    let own = adapters::plan(
+        &task,
+        &cfg("claude-code", None),
+        Path::new("/bin/claude"),
+        None,
+    )
+    .unwrap();
     assert!(own.env.is_empty());
     assert!(own.preflight_url.is_none());
 }
@@ -517,6 +528,7 @@ fn verdict_needs_every_check_to_pass() {
         stdout: Default::default(),
         stderr: Default::default(),
         error: None,
+        started_at: None,
     };
     use CheckOutcome::*;
     assert_eq!(executor::verdict_of(&[]), Verdict::Inconclusive);
@@ -554,6 +566,7 @@ fn export_separates_observed_verified_human_and_unknown() {
         stdout: Default::default(),
         stderr: Default::default(),
         error: None,
+        started_at: None,
     });
     run.evaluation.verified = Some(Verdict::Success);
     run.transition(RunStatus::Succeeded).unwrap();
@@ -663,9 +676,12 @@ echo "turn 1: asking the model with $CHIP_API_KEY" >&2
             let launch = adapters::resolve_executable(
                 "stack-agent-that-does-not-exist",
                 config.executable.as_deref(),
-            )
-            .and_then(|exe| adapters::plan(task, &config, &exe));
+            );
             let run = executor::new_record(&self.store, task, "stack-agent", "9.9.9");
+            let evidence = self.store.evidence_dir(&run.id);
+            std::fs::create_dir_all(&evidence).unwrap();
+            let launch =
+                launch.and_then(|exe| adapters::plan(task, &config, &exe, Some(&evidence)));
             let events = self.events.clone();
             let ctx = Context {
                 store: self.store.clone(),
@@ -815,7 +831,7 @@ echo "turn 1: asking the model with $CHIP_API_KEY" >&2
             notify: Arc::new(|_: &RunRecord| {}),
             cancel: CancellationToken::new(),
             slot: Arc::new(tokio::sync::Semaphore::new(1)),
-            launch: adapters::plan(&task, &config, &agent),
+            launch: adapters::plan(&task, &config, &agent, None),
             path_env: std::env::var("PATH").unwrap_or_default(),
         };
         let run = executor::execute(
@@ -865,7 +881,7 @@ echo "turn 1: asking the model with $CHIP_API_KEY" >&2
             api_key: None,
             executable: Some(agent.to_string_lossy().into_owned()),
         };
-        let mut launch = adapters::plan(&task, &config, &agent).unwrap();
+        let mut launch = adapters::plan(&task, &config, &agent, None).unwrap();
         launch.timeout = Duration::from_millis(500);
         let ctx = Context {
             store: h.store.clone(),
@@ -986,8 +1002,13 @@ echo "turn 1: asking the model with $CHIP_API_KEY" >&2
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let agent = var("ATOMIC_BENCH_AGENT").unwrap_or_else(|| "stack-agent".into());
         let task_id = var("ATOMIC_BENCH_TASK").unwrap_or_else(|| "ledger-fix-discount".into());
+        // ATOMIC_BENCH_DATA_DIR keeps the ledger (e.g. the app's data folder);
+        // otherwise it lives in a temporary directory.
         let data = tempfile::tempdir().unwrap();
-        let store = Store::new(data.path());
+        let root = var("ATOMIC_BENCH_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data.path().to_path_buf());
+        let store = Store::new(&root);
         let task = store.get_task(&task_id).unwrap();
         let config = RunConfig {
             agent_id: agent.clone(),
@@ -998,8 +1019,11 @@ echo "turn 1: asking the model with $CHIP_API_KEY" >&2
         };
         let bin = adapters::adapter(&agent).expect("known agent").bin;
         let path_env = adapters::child_path();
+        let record = executor::new_record(&store, &task, &agent, "live");
+        let evidence = store.evidence_dir(&record.id);
+        std::fs::create_dir_all(&evidence).unwrap();
         let launch = adapters::resolve_executable(bin, config.executable.as_deref())
-            .and_then(|exe| adapters::plan(&task, &config, &exe));
+            .and_then(|exe| adapters::plan(&task, &config, &exe, Some(&evidence)));
         let ctx = Context {
             store: store.clone(),
             notify: Arc::new(|r: &RunRecord| eprintln!("status: {:?}", r.status)),
@@ -1008,7 +1032,7 @@ echo "turn 1: asking the model with $CHIP_API_KEY" >&2
             launch,
             path_env,
         };
-        let run = executor::execute(ctx, executor::new_record(&store, &task, &agent, "live")).await;
+        let run = executor::execute(ctx, record).await;
         println!("{}", serde_json::to_string_pretty(&run.summary()).unwrap());
         println!("{}", export::export_jsonl(std::slice::from_ref(&run)));
         if let Some(key) = &config.api_key {
