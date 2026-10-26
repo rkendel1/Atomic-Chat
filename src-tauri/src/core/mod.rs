@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agent_bench;
 pub mod app;
 pub mod artifact;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]

@@ -850,6 +850,7 @@
     "activity": "Activity",
     "connections": "Connections",
     "connectionsCount": "{{count}} set up",
-    "configured": "Configured"
+    "configured": "Configured",
+    "agentBench": "Agent Bench"
   }
 }

@@ -24,6 +24,19 @@ const EXPECTED_DESKTOP_ONLY = new Set([
   'atomic_core_run_host_step',
   // Restarting Windows or ending the Linux session after a host step that needs it.
   'atomic_core_finish_session_step',
+  // Agent Bench runs external coding agents as child processes; the mobile
+  // targets cannot spawn them, and `PlatformFeature.SYSTEM_INTEGRATIONS`
+  // hides the page there.
+  'bench_cancel_run',
+  'bench_delete_task',
+  'bench_export_runs',
+  'bench_get_run',
+  'bench_list_runs',
+  'bench_list_tasks',
+  'bench_overview',
+  'bench_save_task',
+  'bench_start_run',
+  'bench_submit_review',
   // ChatGPT subscription sign-in. Desktop only on purpose: the OAuth callback
   // needs a loopback listener on a fixed port, and the refresh token needs a
   // mode-0600 file. `PlatformFeature.CHATGPT_SUBSCRIPTION` gates the UI to
