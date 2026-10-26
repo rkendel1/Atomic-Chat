@@ -48,6 +48,9 @@ export const route = {
   launch: {
     index: '/launch/',
   },
+  bench: {
+    index: '/bench/',
+  },
   connectors: {
     index: '/connectors/',
   },

@@ -19,6 +19,7 @@ export const MIN_PAGE_WIDTH = 768
 const SERVER_PATHS = [
   '/api',
   '/launch',
+  '/bench',
   '/settings/local-api-server',
   '/settings/remote-lan',
   '/settings/https-proxy',

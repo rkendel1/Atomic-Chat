@@ -6,6 +6,7 @@ import {
   Cloud,
   Cpu,
   Download,
+  FlaskConical,
   Image,
   MessageCircle,
   Network,
@@ -119,6 +120,14 @@ function ServerNavigation() {
           icon={<Activity size={16} />}
           active={isPathActive(pathname, route.api.activity)}
         />
+        {PlatformFeatures[PlatformFeature.SYSTEM_INTEGRATIONS] && (
+          <NavRow
+            to={route.bench.index}
+            label={t('common:navigation.agentBench')}
+            icon={<FlaskConical size={16} />}
+            active={isPathActive(pathname, route.bench.index, true)}
+          />
+        )}
         {PlatformFeatures[PlatformFeature.LOCAL_API_SERVER] && (
           <>
             <NavRow

@@ -190,6 +190,16 @@ pub fn run() {
         core::system::commands::configure_poolside,
         core::system::commands::configure_muse,
         core::system::commands::configure_stack_agent,
+        core::agent_bench::commands::bench_overview,
+        core::agent_bench::commands::bench_list_tasks,
+        core::agent_bench::commands::bench_save_task,
+        core::agent_bench::commands::bench_delete_task,
+        core::agent_bench::commands::bench_list_runs,
+        core::agent_bench::commands::bench_get_run,
+        core::agent_bench::commands::bench_start_run,
+        core::agent_bench::commands::bench_cancel_run,
+        core::agent_bench::commands::bench_submit_review,
+        core::agent_bench::commands::bench_export_runs,
         core::system::agent_config_detection::detect_configured_agents,
         core::system::commands::open_agent_terminal,
         core::system::commands::launch_editor,
@@ -485,6 +495,7 @@ pub fn run() {
         // The last TensorRT-LLM models root the core named (outside the data folder on Windows).
         .manage(core::filesystem::model_roots::CoreModelRoot::default())
         .manage(core::chat_exec::ChatExecState::default())
+        .manage(core::agent_bench::BenchState::default())
         .manage(AppState {
             app_token: Some(generate_app_token()),
             mcp_servers: Arc::new(Mutex::new(HashMap::new())),

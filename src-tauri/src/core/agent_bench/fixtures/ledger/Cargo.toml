@@ -1,0 +1,10 @@
+[package]
+name = "ledger"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+
+# A standalone workspace, so a copy never joins a workspace above it.
+[workspace]
